@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FastGithub × dev-sidecar 对比研究与优化报告</title>
+<style>
+  :root{
+    --bg:#f7f8fa; --card:#ffffff; --ink:#1f2328; --ink2:#4a5158; --ink3:#7b8288;
+    --line:#e3e6ea; --accent:#1f6feb; --accent-soft:#eaf2ff;
+    --good:#1a7f37; --good-bg:#e8f5ec; --bad:#c0392b; --bad-bg:#fdecea;
+    --warn:#9a6700; --warn-bg:#fff6e5;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    line-height:1.75;font-size:15px}
+  .wrap{max-width:1080px;margin:0 auto;padding:40px 24px 80px}
+  header{border-bottom:2px solid var(--ink);padding-bottom:20px;margin-bottom:34px}
+  h1{font-size:28px;margin:0 0 8px;letter-spacing:-.3px}
+  .sub{color:var(--ink3);font-size:14px}
+  h2{font-size:20px;margin:44px 0 14px;padding-left:12px;border-left:4px solid var(--accent)}
+  h3{font-size:16px;margin:26px 0 10px;color:var(--ink2)}
+  p{margin:10px 0}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px 20px;margin:14px 0}
+  table{width:100%;border-collapse:collapse;margin:14px 0;background:var(--card);
+    border:1px solid var(--line);border-radius:8px;overflow:hidden;font-size:14px}
+  th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+  th{background:#f0f2f5;font-weight:600;color:var(--ink2);white-space:nowrap}
+  tr:last-child td{border-bottom:none}
+  code{background:#f0f2f5;padding:1px 5px;border-radius:4px;font-size:13px;
+    font-family:"SFMono-Regular",Consolas,monospace}
+  .tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;font-weight:600}
+  .t-good{background:var(--good-bg);color:var(--good)}
+  .t-bad{background:var(--bad-bg);color:var(--bad)}
+  .t-warn{background:var(--warn-bg);color:var(--warn)}
+  .t-info{background:var(--accent-soft);color:var(--accent)}
+  ul{margin:8px 0 8px 4px;padding-left:20px}
+  li{margin:5px 0}
+  .kv{display:grid;grid-template-columns:150px 1fr;gap:6px 14px;font-size:14px}
+  .kv>div:nth-child(odd){color:var(--ink3)}
+  .note{background:var(--accent-soft);border-left:4px solid var(--accent);
+    padding:12px 16px;border-radius:0 8px 8px 0;margin:14px 0;font-size:14px}
+  .flow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:12px 0;font-size:13px}
+  .flow span.box{padding:6px 12px;background:#fff;border:1px solid var(--line);border-radius:6px}
+  .flow span.arrow{color:var(--ink3)}
+  pre{background:#1f2328;color:#e6edf3;padding:14px 16px;border-radius:8px;overflow-x:auto;
+    font-size:13px;line-height:1.6;font-family:"SFMono-Regular",Consolas,monospace}
+  footer{margin-top:50px;padding-top:18px;border-top:1px solid var(--line);color:var(--ink3);font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>FastGithub × dev-sidecar 对比研究与优化报告</h1>
+  <div class="sub">
+    基线：<code>yuan71058/FastGithub</code> v2.3.1（.NET，透明拦截）　·　参照：<code>docmirror/dev-sidecar</code>（Electron + mitmproxy，系统代理）<br>
+    产出：优化版 <code>FastGithub v2.4.0</code> + win-x64 自包含单文件可执行程序　·　2026-10-02
+  </div>
+</header>
+
+<h2>一、结论摘要</h2>
+<div class="card">
+  <p>两个项目解决的是同一个问题（国内访问 GitHub 等境外站点慢/不通），但走的是<strong>两条技术路线</strong>，
+  各自的短板恰好能被对方的强项补上：</p>
+  <ul>
+    <li><strong>FastGithub 强在"透明"</strong>：DNS 劫持 + 反向代理，应用零配置；但不具备"失败反馈闭环"，
+      一旦某个 IP 被判定为快，即使它后来连不通了，也会在缓存期内被持续优先选中 —— 这是"装了却没效果"的主因。</li>
+    <li><strong>dev-sidecar 强在"反馈"</strong>：<code>DynamicChoice</code> 持续统计每个 IP 的成功率与连续失败次数，
+      命中阈值立即拉黑换下一个；但它依赖系统代理 + Electron，透明性和资源占用不如 FastGithub。</li>
+  </ul>
+  <p>本次以 <strong>yuan71058/FastGithub 为基座</strong>，把 dev-sidecar 的"IP 健康度反馈闭环""污染地址过滤"
+  "系统代理兜底"三块能力移植进来，同时<strong>保留</strong> FastGithub 的透明拦截、轻量、无需逐应用配置的优势。
+  已产出可运行版本并通过启动冒烟验证。</p>
+</div>
+
+<h2>二、架构对比</h2>
+
+<div class="card">
+  <h3>FastGithub（yuan71058 版）</h3>
+  <div class="flow">
+    <span class="box">WinDivert 驱动</span><span class="arrow">→</span>
+    <span class="box">拦截 UDP:53</span><span class="arrow">→</span>
+    <span class="box">命中域名返回 127.0.0.1</span><span class="arrow">→</span>
+    <span class="box">Kestrel 监听 80/443/22/9418</span><span class="arrow">→</span>
+    <span class="box">自签 CA 做 TLS 中间人 + YARP 反向代理</span>
+  </div>
+  <p class="sub">非 Windows 平台退化为 <code>127.0.0.1:38457</code> 正向代理。</p>
+</div>
+
+<div class="card">
+  <h3>dev-sidecar</h3>
+  <div class="flow">
+    <span class="box">gui（Electron + Vue3）</span><span class="arrow">→</span>
+    <span class="box">core（编排）</span><span class="arrow">→</span>
+    <span class="box">fork mitmproxy 子进程 31180/31181</span><span class="arrow">→</span>
+    <span class="box">设置系统代理</span><span class="arrow">→</span>
+    <span class="box">node-forge 伪造证书（LRU 缓存）</span>
+  </div>
+  <p class="sub">插件体系（git / node / pip / overwall）、多 provider DNS（UDP/TCP/DoH/DoT/预置 IP）。</p>
+</div>
+
+<h2>三、核心能力对照矩阵</h2>
+<table>
+  <tr><th style="width:150px">维度</th><th>dev-sidecar</th><th>FastGithub（原版）</th><th style="width:110px">判定</th></tr>
+  <tr>
+    <td>接入方式</td>
+    <td>系统代理，需逐应用/全局配置，被其它代理软件覆盖即失效</td>
+    <td>DNS 劫持 + 反向代理，应用零配置</td>
+    <td><span class="tag t-good">FG 更优</span></td>
+  </tr>
+  <tr>
+    <td>IP 选择依据</td>
+    <td>TCP 时延 <strong>+ 成功率 + 连续失败计数</strong>（DynamicChoice）</td>
+    <td><strong>仅 TCP 连接时延</strong>，无 TLS 层验证</td>
+    <td><span class="tag t-bad">FG 缺失</span></td>
+  </tr>
+  <tr>
+    <td>失败反馈闭环</td>
+    <td>有：<code>reportProbeResult</code> / <code>keepErrorCount</code> / <code>successRate&lt;0.4</code> 即换</td>
+    <td>无：请求失败只 <code>innerExceptions.Add(ex)</code>，坏 IP 继续在缓存里活 5 分钟</td>
+    <td><span class="tag t-bad">FG 缺失</span></td>
+  </tr>
+  <tr>
+    <td>污染/无效 IP 过滤</td>
+    <td>有：<code>isZeroIp</code> 过滤 0.0.0.0 / ::</td>
+    <td>仅过滤 loopback</td>
+    <td><span class="tag t-bad">FG 偏弱</span></td>
+  </tr>
+  <tr>
+    <td>加密 DNS</td>
+    <td>多 provider：UDP / TCP / DoH / DoT</td>
+    <td>dnscrypt-proxy（支持 DoH）+ 回退 DNS + 在线 hosts 源</td>
+    <td><span class="tag t-info">各有千秋</span></td>
+  </tr>
+  <tr>
+    <td>已知可用 IP 预置</td>
+    <td>有：<code>preSetIpList</code></td>
+    <td>无，但用在线 hosts 源（raw.hellogithub.com）替代</td>
+    <td><span class="tag t-info">等价替代</span></td>
+  </tr>
+  <tr>
+    <td>拦截失败时</td>
+    <td>代理方式，天然无驱动依赖</td>
+    <td>WinDivert 失败→<strong>整个进程退出</strong>，用户无任何退路</td>
+    <td><span class="tag t-bad">FG 缺失</span></td>
+  </tr>
+  <tr>
+    <td>部署体积 / 依赖</td>
+    <td>Electron + Node，体积大</td>
+    <td>.NET 单文件，轻量</td>
+    <td><span class="tag t-good">FG 更优</span></td>
+  </tr>
+  <tr>
+    <td>存活风险</td>
+    <td>系统代理被其它软件抢占</td>
+    <td>驱动类组件易被杀软误报、需管理员权限</td>
+    <td><span class="tag t-warn">各有风险</span></td>
+  </tr>
+</table>
+
+<h2>四、诊断：为什么原版"装了没效果"</h2>
+<div class="card">
+  <div class="kv">
+    <div>症状</div><div>启动正常、日志正常，但访问 GitHub 依然超时或极慢</div>
+    <div>根因 1</div><div><code>IPAddressService.GetAddressElapsedAsync</code> 只测 TCP 握手耗时。在 TLS 层被阻断/重置的场景下，TCP 握手照样成功，坏 IP 因此被测速逻辑判定为"快"</div>
+    <div>根因 2</div><div><code>HttpClientHandler.ConnectCallback</code> 的 catch 块只做 <code>innerExceptions.Add(ex)</code>，<strong>没有把失败回写给解析器</strong>，坏 IP 在 5 分钟缓存期内被反复选中</div>
+    <div>根因 3</div><div><code>DnsClient.LookupCoreAsync</code> 只过滤 loopback。国内 DNS 返回的污染地址往往"握手很快"，会稳定进入首选队列并稳定失败</div>
+    <div>根因 4</div><div>WinDivert 一旦加载失败，<code>Dns/TcpInterceptHostedService</code> 直接 <code>host.StopAsync()</code>，程序整体退出</div>
+  </div>
+</div>
+
+<h2>五、取长补短：本次落地的改动</h2>
+<table>
+  <tr><th style="width:230px">文件</th><th>改动</th><th style="width:120px">能力来源</th></tr>
+  <tr>
+    <td><code>DomainResolve/IpHealthTracker.cs</code><br><span class="tag t-info">新增</span></td>
+    <td>移植 <code>DynamicChoice</code>：按 <code>域名|IP</code> 统计成功率与连续失败数；连续失败 ≥1 或成功率 &lt;0.4 立即拉黑 2 分钟；提供 <code>GetPenalty()</code> 参与排序；成功后自动解除拉黑</td>
+    <td>dev-sidecar<br>choice/index.js</td>
+  </tr>
+  <tr>
+    <td><code>DomainResolve/IpAddressFilter.cs</code><br><span class="tag t-info">新增</span></td>
+    <td>移植 <code>isZeroIp</code> 并补齐：0.0.0.0、127/8、10/8、100.64/10、169.254/16、172.16/12、192.168/16、198.18/15、TEST-NET、组播/保留段、IPv6 的 ::/fc00::/7/fe80::/10/2002::，以及 24 个公开整理的已知污染 IP</td>
+    <td>dev-sidecar<br>isZeroIp</td>
+  </tr>
+  <tr>
+    <td><code>DomainResolve/IDomainResolver.cs</code></td>
+    <td>新增 <code>ReportSuccess</code> / <code>ReportFailure</code> / <code>IsBlacklisted</code>，在接口层建立反馈通道</td>
+    <td>本次设计</td>
+  </tr>
+  <tr>
+    <td><code>DomainResolve/DomainResolver.cs</code></td>
+    <td>实现上述接口；当<strong>首选 IP</strong> 被拉黑时触发一次重选（单域名 30 秒冷却，防止失败风暴打满 DNS）</td>
+    <td>本次设计</td>
+  </tr>
+  <tr>
+    <td><code>DomainResolve/IPAddressService.cs</code></td>
+    <td>排序由「时延」改为「<strong>健康度优先，时延其次</strong>」；剔除已拉黑 IP；若全部被拉黑则退化为按健康度排序，保证不会无 IP 可用</td>
+    <td>dev-sidecar doRank</td>
+  </tr>
+  <tr>
+    <td><code>DomainResolve/DnsClient.cs</code></td>
+    <td>解析结果统一走 <code>IpAddressFilter</code>；移除重复 yield 加密 DNS 的死代码（第二次必然命中同一缓存）；输出过滤计数日志</td>
+    <td>本次设计</td>
+  </tr>
+  <tr>
+    <td><code>Http/HttpClientHandler.cs</code></td>
+    <td>连接成功（HTTPS 含 TLS 握手）回写成功、失败回写失败；跳过已拉黑 IP 不再浪费一次超时等待；单 IP 连接超时 10s → <strong>5s</strong>（3 个 IP 全坏的最坏耗时从 30s 降到 15s）</td>
+    <td>dev-sidecar<br>SpeedTester</td>
+  </tr>
+  <tr>
+    <td><code>Startup.cs</code><br><code>KestrelServerExtensions.cs</code></td>
+    <td>Windows 上<strong>额外监听 127.0.0.1:38457 正向代理</strong>（端口被占用时降级告警而非崩溃），作为透明拦截失效时的可用通道</td>
+    <td>dev-sidecar<br>系统代理模式</td>
+  </tr>
+  <tr>
+    <td><code>PacketIntercept/DnsInterceptHostedService.cs</code><br><code>PacketIntercept/TcpInterceptHostedService.cs</code></td>
+    <td>WinDivert 异常不再终止整个进程，改为<strong>降级存活</strong>并打印"请把系统代理设为 http://127.0.0.1:38457"的提示</td>
+    <td>dev-sidecar<br>无驱动依赖</td>
+  </tr>
+  <tr>
+    <td><code>Configuration/FastGithubOptions.cs</code></td>
+    <td>抽出 <code>DefaultHttpProxyPort</code> 常量（38457）</td>
+    <td>本次设计</td>
+  </tr>
+  <tr>
+    <td><code>Directory.Build.props</code><br><code>FastGithub/FastGithub.csproj</code></td>
+    <td>TFM <code>net7.0 → net10.0</code>（net7 已于 2024-05 EOL，net8/net9 于 2026-11 EOL，net10 为 LTS 至 2028-11）；
+      修复 <code>7.0.0-rc*</code> 浮动版本号（该 RC 版本已无法还原）→ 固定 <code>10.0.0</code>；版本 <code>2.3.1 → 2.4.0</code></td>
+    <td>工程化修复</td>
+  </tr>
+  <tr>
+    <td><code>NuGet.config</code><br><span class="tag t-info">新增</span></td>
+    <td>显式声明包源，避免还原时命中不可达的官方源</td>
+    <td>工程化修复</td>
+  </tr>
+</table>
+
+<div class="note">
+  <strong>保留 FastGithub 优势（未改动）：</strong>DNS 劫持透明接入、Kestrel + YARP 反向代理、SSH(22)/Git(9418) 协议代理、
+  dnscrypt-proxy 加密 DNS、在线 hosts 源、流量统计、PAC 服务。这些都是相对 dev-sidecar 的明显优势，不做替换。
+</div>
+
+<h2>六、刻意未采纳的部分</h2>
+<table>
+  <tr><th style="width:170px">dev-sidecar 能力</th><th>为何不移植</th></tr>
+  <tr><td><code>preSetIpList</code> 硬编码已知可用 IP</td><td>数据是静态的，GitHub CDN 段会轮换，过期后反而变成"稳定失败"的来源；FastGithub 已有在线 hosts 源做等价且可更新的事</td></tr>
+  <tr><td>插件体系（git/npm/pip 自动配置代理）</td><td>透明拦截模式下不需要逐工具配置；可作为后续可选增强，但不进入本次交付</td></tr>
+  <tr><td>Electron GUI 与多 provider DNS 全量实现</td><td>体积与复杂度代价大；FastGithub 的 dnscrypt-proxy 已覆盖 DoH 场景</td></tr>
+</table>
+
+<h2>七、构建产物与验证</h2>
+<div class="card">
+  <div class="kv">
+    <div>目标框架</div><div>net10.0</div>
+    <div>运行时标识</div><div>win-x64，<strong>self-contained</strong>（目标机无需安装 .NET）</div>
+    <div>打包形态</div><div>单文件 + 压缩（<code>PublishSingleFile=true</code>、<code>EnableCompressionInSingleFile=true</code>）</div>
+    <div>主程序</div><div><code>publish/win-x64/fastgithub.exe</code>（约 49 MB）</div>
+    <div>附带内容</div><div><code>appsettings/</code>（github/google/microsoft 等 9 份域名配置）、<code>dnscrypt-proxy/</code>、证书目录运行时生成</div>
+    <div>编译结果</div><div>0 错误，5 条告警（均为 net10 的过时 API 提示，不影响运行）</div>
+    <div>冒烟验证</div><div>已实际启动：监听 https:443 / http:80 / ssh:22 / git:9418 / http:38457，输出「FastGithub 启动完成，当前版本为 V2.4.0」，随后正常退出</div>
+  </div>
+</div>
+
+<h3>构建命令</h3>
+<pre>dotnet publish FastGithub/FastGithub.csproj -c Release -r win-x64 ^
+  --self-contained true -p:PublishSingleFile=true -m:1 -nr:false -o publish/win-x64</pre>
+<div class="note">
+  本机环境原先没有 .NET SDK，只有 7.0.20 运行时，且原项目引用的 <code>7.0.0-rc*</code> 包已不可还原。
+  本次改用 .NET SDK 10.0.100 完成构建；若在你自己的机器上构建，安装 .NET 10 SDK 后执行上面的命令即可。
+</div>
+
+<h2>八、运行说明</h2>
+<div class="card">
+  <ul>
+    <li><strong>正常用法</strong>：以<strong>管理员身份</strong>运行 <code>fastgithub.exe</code>。透明拦截（DNS 劫持）需要管理员权限与 WinDivert 驱动。</li>
+    <li><strong>降级用法</strong>：若驱动被杀软拦截或不想用管理员权限，程序仍会监听 <code>127.0.0.1:38457</code>，
+      手动把系统代理设为该地址即可继续使用（这是本次新增的兜底通道，原版此时会直接退出）。</li>
+    <li><strong>服务模式</strong>：<code>fastgithub start</code> / <code>fastgithub stop</code> 安装与卸载 Windows 服务。</li>
+    <li><strong>手动刷新 IP</strong>：访问 <code>http://127.0.0.1:38456/refresh-ip</code>（UI 端口）可触发 IP 重选。</li>
+    <li><strong>证书</strong>：首次启动会在 <code>cacert/</code> 生成自签 CA 并尝试装入「受信任的根证书颁发机构」；
+      若未以管理员运行会失败并提示手动安装。</li>
+  </ul>
+</div>
+
+<h2>九、后续建议</h2>
+<ul>
+  <li><strong>把健康度指标暴露到 UI/日志</strong>：当前只在内部生效，建议让 <code>/flowStatistics</code> 一并返回各 IP 的成功率，便于排查。</li>
+  <li><strong>测速加入 TLS 层验证</strong>：目前测速仍是纯 TCP。可在 <code>IPAddressService</code> 中对 443 端口补一次带 SNI 的 TLS 握手探测，进一步压缩"能连不能用"的 IP 生存空间。</li>
+  <li><strong>健康度参数可配置</strong>：<code>KeepErrorThreshold</code> / <code>MinSuccessRate</code> / <code>BlacklistDuration</code> 目前是硬编码默认值，建议下沉到 <code>appsettings.json</code>。</li>
+  <li><strong>清理 net10 过时 API 告警</strong>：<code>X509Certificate2(string/byte[])</code> 构造已过时，应改用 <code>X509CertificateLoader</code>。</li>
+</ul>
+
+<footer>
+  基线 <code>yuan71058/FastGithub</code> v2.3.1 · 参照 <code>docmirror/dev-sidecar</code> · 优化版 v2.4.0（net10.0 / win-x64）
+</footer>
+
+</div>
+</body>
+</html>
