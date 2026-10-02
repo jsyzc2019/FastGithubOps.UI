@@ -97,8 +97,28 @@ namespace FastGithub.Http
                 UseProxy = false,
                 UseCookies = false,
                 AllowAutoRedirect = false,
+                // 反向代理必须透传原始编码：这里若自动解压，
+                // 响应体长度与 Content-Length/Content-Encoding 会对不上，下游直接解析失败。
                 AutomaticDecompression = DecompressionMethods.None,
-                ConnectCallback = this.ConnectCallback
+                ConnectCallback = this.ConnectCallback,
+
+                // 每个目标站点的并发连接数。跨境链路上一连接常被打满，
+                // 默认虽然是不限，但显式给出可避免将来被框架默认值改变。
+                MaxConnectionsPerServer = 32,
+
+                // 空闲连接保留时间：GitHub 的请求是密集短连接（API/raw），
+                // 连接复用能省掉每次的 TCP+TLS 往返。默认 1 分钟偏保守。
+                PooledConnectionIdleTimeout = TimeSpan.FromMinutes(3d),
+
+                // 单一连接的最长存活时间。长时间复用同一连接时，
+                // 中间设备可能在无通告的情况下掐断，表现为偶发请求失败。
+                PooledConnectionLifetime = TimeSpan.FromMinutes(10d),
+
+                // 响应体未读完时需要 drain 才能复用连接，给一个较短的预算，
+                // 避免慢客户端长期占用连接池。
+                ResponseDrainTimeout = TimeSpan.FromSeconds(5d),
+
+                EnableMultipleHttp2Connections = true
             };
         }
 
@@ -268,7 +288,7 @@ namespace FastGithub.Http
         /// </returns>
         private async ValueTask<(Stream Stream, bool FullyVerified)> ConnectAsync(SocketsHttpConnectionContext context, IPEndPoint ipEndPoint, CancellationToken cancellationToken)
         {
-            var socket = new Socket(ipEndPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+            var socket = TcpSocketFactory.Create(ipEndPoint.AddressFamily);
             await socket.ConnectAsync(ipEndPoint, cancellationToken);
             var stream = new NetworkStream(socket, ownsSocket: true);
 
