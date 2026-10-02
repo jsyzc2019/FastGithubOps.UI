@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
@@ -27,6 +28,10 @@ namespace FastGithub.DomainResolve
         private readonly TimeSpan problemElapsedExpiration = TimeSpan.FromMinutes(1d);
         private readonly TimeSpan normalElapsedExpiration = TimeSpan.FromMinutes(5d);
         private readonly TimeSpan connectTimeout = TimeSpan.FromSeconds(5d);
+
+        // TLS 探测的独立预算：TCP 已连通时握手慢更可能是链路慢而非 IP 坏，
+        // 与 TCP 超时共用一份预算会把"慢但可用"的 IP 误杀。
+        private readonly TimeSpan tlsProbeTimeout = TimeSpan.FromSeconds(8d);
         private readonly IMemoryCache addressElapsedCache = new MemoryCache(Options.Create(new MemoryCacheOptions()));
 
         private readonly DnsClient dnsClient;
@@ -93,10 +98,10 @@ namespace FastGithub.DomainResolve
                 return Array.Empty<IPAddress>();
             }
 
-            var addressElapsedTasks = ipEndPoints.Select(item => this.GetAddressElapsedAsync(item, cancellationToken));
+            var host = dnsEndPoint.Host;
+            var addressElapsedTasks = ipEndPoints.Select(item => this.GetAddressElapsedAsync(item, host, cancellationToken));
             var addressElapseds = await Task.WhenAll(addressElapsedTasks);
 
-            var host = dnsEndPoint.Host;
             var connectable = addressElapseds
                 .Where(item => item.Elapsed < TimeSpan.MaxValue)
                 .ToArray();
@@ -124,11 +129,17 @@ namespace FastGithub.DomainResolve
 
         /// <summary>
         /// 获取IP节点的时延
+        /// <para>
+        /// 对 https 端口额外完成一次真实 TLS 握手。只测 TCP 会选出"握手快但用不了"的 IP：
+        /// 干扰设备对 TLS 层的阻断（RST/黑洞）在 TCP 层表现为连接成功，
+        /// 于是这类 IP 靠极低时延长期占据首选，用户体感就是"明明连上了却一直转圈"。
+        /// </para>
         /// </summary> 
         /// <param name="endPoint"></param>
+        /// <param name="host">域名，用于TLS握手的SNI</param>
         /// <param name="cancellationToken"></param>
         /// <returns></returns>
-        private async Task<AddressElapsed> GetAddressElapsedAsync(IPEndPoint endPoint, CancellationToken cancellationToken)
+        private async Task<AddressElapsed> GetAddressElapsedAsync(IPEndPoint endPoint, string host, CancellationToken cancellationToken)
         {
             if (this.addressElapsedCache.TryGetValue<AddressElapsed>(endPoint, out var addressElapsed))
             {
@@ -142,6 +153,21 @@ namespace FastGithub.DomainResolve
                 using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutTokenSource.Token);
                 using var socket = new Socket(endPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
                 await socket.ConnectAsync(endPoint, linkedTokenSource.Token);
+
+                if (IsTlsProbePort(endPoint.Port))
+                {
+                    // 握手预算独立于TCP：TCP已连通时握手慢更可能是链路慢而非IP坏。
+                    // 这里不校验信任链——目的是确认"该IP能否完成TLS握手"，
+                    // 真正的证书校验发生在请求连接时（HttpClientHandler）。
+                    using var sslTimeoutSource = new CancellationTokenSource(this.tlsProbeTimeout);
+                    using var sslTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, sslTimeoutSource.Token);
+                    using var sslStream = new SslStream(new NetworkStream(socket, ownsSocket: false), leaveInnerStreamOpen: true);
+                    await sslStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+                    {
+                        TargetHost = host,
+                        RemoteCertificateValidationCallback = (_, _, _, _) => true
+                    }, sslTokenSource.Token);
+                }
 
                 addressElapsed = new AddressElapsed(endPoint.Address, stopWatch.Elapsed);
                 return this.addressElapsedCache.Set(endPoint, addressElapsed, this.normalElapsedExpiration);
@@ -159,6 +185,13 @@ namespace FastGithub.DomainResolve
                 stopWatch.Stop();
             }
         }
+
+        /// <summary>
+        /// 该端口是否需要做TLS握手探测
+        /// </summary>
+        /// <param name="port"></param>
+        /// <returns></returns>
+        private static bool IsTlsProbePort(int port) => port == 443 || port == 8443;
 
         /// <summary>
         /// 是否为本机网络问题

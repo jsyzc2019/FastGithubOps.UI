@@ -32,6 +32,9 @@ namespace FastGithub.Http
         // TLS 握手单独给一份更宽的预算，避免把"握手慢但服务正常"的IP判为坏IP
         private readonly TimeSpan tlsHandshakeTimeout = TimeSpan.FromSeconds(10d);
 
+        // 并发赛马中后续候选的错开间隔（RFC 8305 Happy Eyeballs）
+        private static readonly TimeSpan RACE_STAGGER = TimeSpan.FromMilliseconds(250d);
+
         // 刷新闸门按域名隔离。
         // 原实现是一个全局 static 令牌，任意域名触发刷新会让其他域名
         // 在最长10秒（hosts源HTTP超时）内无法通过该路径恢复。
@@ -132,34 +135,81 @@ namespace FastGithub.Http
                 candidates.AddRange(blacklisted);
             }
 
-            foreach (var ipEndPoint in candidates)
-            {
-                try
-                {
-                    using var timeoutTokenSource = new CancellationTokenSource(this.connectTimeout);
-                    using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(timeoutTokenSource.Token, cancellationToken);
-                    var (stream, fullyVerified) = await this.ConnectAsync(context, ipEndPoint, linkedTokenSource.Token);
+            // 并发赛马（RFC 8305 Happy Eyeballs 思路）：
+            // 原实现是串行逐个尝试，一个坏IP要等满 connectTimeout 才轮到下一个，
+            // 3 个候选全坏时用户要干等 15 秒。并发发起后取第一个握手成功的连接，
+            // 最坏耗时从 N×超时 降到 1×超时。
+            using var raceTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var pending = new List<Task<(IPEndPoint EndPoint, Stream? Stream, bool Verified, Exception? Error)>>();
 
-                    // 仅在完成 TLS 握手（证书链校验通过）后才回写健康度。
-                    // 纯 http 场景只完成 TCP 连通，证明不了该IP真正可用——
-                    // 此时既不上报成功（会把坏IP的惩罚值洗白）也不上报失败
-                    // （TCP 确实通了，判失败同样是冤枉），保持统计中性。
-                    if (fullyVerified)
+            for (var i = 0; i < candidates.Count; i++)
+            {
+                // 首个立即发起，其余错开 ~250ms（RFC 8305）。
+                // 全部同时打出去会在链路拥塞时互相拖慢，错开后通常第一个就能成功，
+                // 既拿到并发的容错又不必承担同时建连的开销。
+                if (i > 0)
+                {
+                    try
                     {
-                        this.domainResolver.ReportSuccess(context.DnsEndPoint, ipEndPoint.Address);
+                        await Task.Delay(RACE_STAGGER, raceTokenSource.Token);
                     }
-                    return stream;
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
                 }
-                catch (OperationCanceledException)
+                pending.Add(this.RaceConnectAsync(context, ipEndPoint: candidates[i], raceTokenSource.Token));
+            }
+
+            try
+            {
+                while (pending.Count > 0)
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    this.domainResolver.ReportFailure(context.DnsEndPoint, ipEndPoint.Address);
-                    innerExceptions.Add(new HttpConnectTimeoutException(ipEndPoint.Address));
+                    var completed = await Task.WhenAny(pending);
+                    pending.Remove(completed);
+
+                    var (endPoint, stream, verified, error) = await completed;
+                    if (error == null && stream != null)
+                    {
+                        // 胜出的连接已可用，取消其余仍在握手的尝试，回收 socket
+                        raceTokenSource.Cancel();
+
+                        // 仅在完成 TLS 握手（证书链校验通过）后才回写健康度。
+                        // 纯 http 场景只完成 TCP 连通，证明不了该IP真正可用——
+                        // 此时既不上报成功（会把坏IP的惩罚值洗白）也不上报失败
+                        // （TCP 确实通了，判失败同样是冤枉），保持统计中性。
+                        if (verified)
+                        {
+                            this.domainResolver.ReportSuccess(context.DnsEndPoint, endPoint.Address);
+                        }
+                        return stream;
+                    }
+
+                    if (error is OperationCanceledException)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        this.domainResolver.ReportFailure(context.DnsEndPoint, endPoint.Address);
+                        innerExceptions.Add(new HttpConnectTimeoutException(endPoint.Address));
+                    }
+                    else if (error != null)
+                    {
+                        this.domainResolver.ReportFailure(context.DnsEndPoint, endPoint.Address);
+                        innerExceptions.Add(error);
+                    }
                 }
-                catch (Exception ex)
+            }
+            finally
+            {
+                // 未胜出的连接必须回收，否则并发赛马会泄漏 socket
+                foreach (var task in pending)
                 {
-                    this.domainResolver.ReportFailure(context.DnsEndPoint, ipEndPoint.Address);
-                    innerExceptions.Add(ex);
+                    _ = task.ContinueWith(t =>
+                    {
+                        if (t.IsCompletedSuccessfully)
+                        {
+                            t.Result.Stream?.Dispose();
+                        }
+                    }, TaskContinuationOptions.ExecuteSynchronously);
                 }
             }
 
@@ -259,6 +309,32 @@ namespace FastGithub.Http
                 }
 
                 return errors == SslPolicyErrors.None;
+            }
+        }
+
+        /// <summary>
+        /// 并发赛马中的单次连接尝试。
+        /// 不抛异常，把结果（成功或异常）打包返回，便于调用方取第一个成功者。
+        /// </summary>
+        /// <param name="context"></param>
+        /// <param name="ipEndPoint"></param>
+        /// <param name="cancellationToken"></param>
+        /// <returns></returns>
+        private async Task<(IPEndPoint EndPoint, Stream? Stream, bool Verified, Exception? Error)> RaceConnectAsync(
+            SocketsHttpConnectionContext context,
+            IPEndPoint ipEndPoint,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                using var timeoutTokenSource = new CancellationTokenSource(this.connectTimeout);
+                using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(timeoutTokenSource.Token, cancellationToken);
+                var (stream, verified) = await this.ConnectAsync(context, ipEndPoint, linkedTokenSource.Token);
+                return (ipEndPoint, stream, verified, null);
+            }
+            catch (Exception ex)
+            {
+                return (ipEndPoint, null, false, ex);
             }
         }
 
