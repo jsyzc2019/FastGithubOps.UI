@@ -134,6 +134,16 @@ namespace FastGithub.DomainResolve
         public async Task RefreshAsync(CancellationToken cancellationToken = default)
         {
             this.logger.LogInformation("触发IP刷新：清空缓存并重新解析测速");
+
+            // 主动解除所有域名的IP拉黑状态。
+            // 拉黑本身只在 BlacklistDuration 内自然过期，若不在刷新时清除，
+            // 一次网络瞬断导致的集体拉黑会让该域名在拉黑期内完全不可用；
+            // 而单域名冷却只有30秒，远短于2分钟拉黑时长，两者不配合就没有恢复路径。
+            foreach (var endPoint in this.dnsEndPointAddress.Keys)
+            {
+                this.healthTracker.Reset(endPoint.Host);
+            }
+
             this.addressService.ClearCache();
             await this.TestSpeedAsync(hostsOnly: false, cancellationToken);
             await this.hostsService.RefreshAsync(cancellationToken);
@@ -178,7 +188,11 @@ namespace FastGithub.DomainResolve
                 return;
             }
             this.refreshCooldown[endPoint.Host] = now;
-            _ = this.RefreshAsync();
+
+            // 观察异常：否则刷新失败会成为 unobserved task exception 而完全静默
+            _ = this.RefreshAsync().ContinueWith(
+                task => this.logger.LogError(task.Exception ?? new Exception("未知异常"), $"{endPoint.Host} 自动刷新IP失败"),
+                TaskContinuationOptions.OnlyOnFaulted);
         }
 
         /// <summary>

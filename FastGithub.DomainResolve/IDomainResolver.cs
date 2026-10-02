@@ -8,7 +8,7 @@ namespace FastGithub.DomainResolve
     /// <summary>
     /// 域名解析器
     /// </summary>
-    public interface IDomainResolver
+    public interface IDomainResolver : IIpHealthFeedback
     { 
         /// <summary>
         /// 解析所有ip
@@ -38,31 +38,5 @@ namespace FastGithub.DomainResolve
         /// <param name="cancellationToken"></param>
         /// <returns></returns>
         Task RefreshHostsAsync(CancellationToken cancellationToken = default);
-
-        /// <summary>
-        /// 上报一次连接成功
-        /// <para>
-        /// 移植自 dev-sidecar 的失败反馈闭环：真实请求的结果需要回流到IP选择逻辑，
-        /// 否则坏IP会一直停留在"测速最快"的位置上。
-        /// </para>
-        /// </summary>
-        /// <param name="endPoint">节点</param>
-        /// <param name="address">实际使用的IP</param>
-        void ReportSuccess(DnsEndPoint endPoint, IPAddress address);
-
-        /// <summary>
-        /// 上报一次连接失败
-        /// </summary>
-        /// <param name="endPoint">节点</param>
-        /// <param name="address">实际使用的IP</param>
-        void ReportFailure(DnsEndPoint endPoint, IPAddress address);
-
-        /// <summary>
-        /// 该IP是否已被判定为不可用
-        /// </summary>
-        /// <param name="endPoint">节点</param>
-        /// <param name="address">IP</param>
-        /// <returns></returns>
-        bool IsBlacklisted(DnsEndPoint endPoint, IPAddress address);
     }
 }

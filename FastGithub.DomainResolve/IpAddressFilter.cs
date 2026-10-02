@@ -83,13 +83,24 @@ namespace FastGithub.DomainResolve
             {
                 return true;
             }
-            // 192.0.0.0/24、192.0.2.0/24、192.88.99.0/24、192.168.0.0/16
-            if (bytes[0] == 192 && (bytes[1] == 0 || bytes[1] == 2 || bytes[1] == 88 || bytes[1] == 168))
+      // 192.168.0.0/16（私有网段）
+            if (bytes[0] == 192 && bytes[1] == 168)
             {
                 return true;
             }
-            // 198.18.0.0/15、198.51.100.0/24(TEST-NET-2)
-            if (bytes[0] == 198 && (bytes[1] == 18 || bytes[1] == 19 || bytes[1] == 51))
+            // 192.0.0.0/24（IETF协议保留）、192.0.2.0/24（TEST-NET-1）、
+            // 192.88.99.0/24（6to4中继，RFC 7526 已废弃）
+            if (bytes[0] == 192 && bytes[2] == 0 && (bytes[1] == 0 || bytes[1] == 2 || bytes[1] == 88))
+            {
+                return true;
+            }
+     // 198.18.0.0/15（基准测试保留段）
+            if (bytes[0] == 198 && (bytes[1] == 18 || bytes[1] == 19))
+            {
+                return true;
+            }
+            // 198.51.100.0/24（TEST-NET-2）
+            if (bytes[0] == 198 && bytes[1] == 51 && bytes[2] == 100)
             {
                 return true;
             }
@@ -129,11 +140,30 @@ namespace FastGithub.DomainResolve
             {
                 return true;
             }
-            // 2002::/16（6to4）与 ::ffff:0:0/96（IPv4映射）一般不是有效公网出口
+            // 2002::/16（6to4）不是有效公网出口
             if (bytes[0] == 0x20 && bytes[1] == 0x02)
             {
                 return true;
             }
+
+            // ::ffff:0:0/96（IPv4映射地址）—— 必须单独判定。
+            // 已知污染地址常以 ::ffff:203.98.7.65 这样的映射形式经 AAAA 记录返回，
+            // 而 knownPoisonIps 只收录 IPv4 字面量；不在此处拆回 IPv4 递归判定，
+            // 污染地址就能完整绕过整个过滤器。
+            if (bytes[0] == 0x00 && bytes[1] == 0x00 && bytes[10] == 0xFF && bytes[11] == 0xFF)
+            {
+                var mapped = new byte[4];
+                Array.Copy(bytes, 12, mapped, 0, 4);
+                return IsInvalid(new IPAddress(mapped));
+            }
+
+            // ::/96（IPv4兼容地址，已废弃）与 64:ff9b::/96（NAT64）
+            if ((bytes[0] == 0x00 && bytes[1] == 0x00 && bytes[2] == 0x00 && bytes[3] == 0x00)
+                || (bytes[0] == 0x00 && bytes[1] == 0x64 && bytes[2] == 0xFF && bytes[3] == 0x9B))
+            {
+                return true;
+            }
+
             return false;
         }
 

@@ -1,6 +1,7 @@
 ﻿using FastGithub.Configuration;
 using FastGithub.DomainResolve;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -23,9 +24,19 @@ namespace FastGithub.Http
         private readonly DomainConfig domainConfig;
         private readonly IDomainResolver domainResolver;
         // 与 dev-sidecar 的 SpeedTester 对齐：单IP 5秒连不上就换下一个，
-        // 10秒会让"3个IP全坏"的最坏情况拖到30秒，用户体感就是卡死
+        // 10秒会让"3个IP全坏"的最坏情况拖到30秒，用户体感就是卡死。
+        // 注意该预算只覆盖 TCP 建连：跨境链路的 TLS 握手（含证书链校验、
+        // 可能的 OCSP/CRL 回源）经常超过 5s，把两者压在同一预算内会误杀优质IP。
         private readonly TimeSpan connectTimeout = TimeSpan.FromSeconds(5d);
-        private static int refreshingToken = 0;
+
+        // TLS 握手单独给一份更宽的预算，避免把"握手慢但服务正常"的IP判为坏IP
+        private readonly TimeSpan tlsHandshakeTimeout = TimeSpan.FromSeconds(10d);
+
+        // 刷新闸门按域名隔离。
+        // 原实现是一个全局 static 令牌，任意域名触发刷新会让其他域名
+        // 在最长10秒（hosts源HTTP超时）内无法通过该路径恢复。
+        private static readonly ConcurrentDictionary<string, SemaphoreSlim> refreshGates
+            = new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
         /// HttpClientHandler
@@ -97,25 +108,46 @@ namespace FastGithub.Http
         private async ValueTask<Stream> ConnectCallback(SocketsHttpConnectionContext context, CancellationToken cancellationToken)
         {
             var innerExceptions = new List<Exception>();
-            var ipEndPoints = this.GetIPEndPointsAsync(context.DnsEndPoint, cancellationToken);
+            var candidates = new List<IPEndPoint>();
+            var blacklisted = new List<IPEndPoint>();
 
-            await foreach (var ipEndPoint in ipEndPoints)
+            await foreach (var ipEndPoint in this.GetIPEndPointsAsync(context.DnsEndPoint, cancellationToken))
             {
                 // 已被判定为不可用的IP不再浪费一次连接超时等待
                 if (this.domainResolver.IsBlacklisted(context.DnsEndPoint, ipEndPoint.Address))
                 {
+                    blacklisted.Add(ipEndPoint);
                     innerExceptions.Add(new HttpConnectTimeoutException(ipEndPoint.Address));
                     continue;
                 }
+                candidates.Add(ipEndPoint);
+            }
 
+            // 兜底：若候选全部被拉黑，则强制回退，把已拉黑的IP也试一轮。
+            // 否则一次网络瞬断（WiFi抖动/网关重启）就能让某个域名的全部IP同时进黑名单，
+            // 该域名将在 BlacklistDuration 内完全不可用——"全挂"这个触发条件
+            // 天然就是"全黑"这个故障态。
+            if (candidates.Count == 0 && blacklisted.Count > 0)
+            {
+                candidates.AddRange(blacklisted);
+            }
+
+            foreach (var ipEndPoint in candidates)
+            {
                 try
                 {
                     using var timeoutTokenSource = new CancellationTokenSource(this.connectTimeout);
                     using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(timeoutTokenSource.Token, cancellationToken);
-                    var stream = await this.ConnectAsync(context, ipEndPoint, linkedTokenSource.Token);
+                    var (stream, fullyVerified) = await this.ConnectAsync(context, ipEndPoint, linkedTokenSource.Token);
 
-                    // 成功建立（https时含TLS握手）后回写健康度
-                    this.domainResolver.ReportSuccess(context.DnsEndPoint, ipEndPoint.Address);
+                    // 仅在完成 TLS 握手（证书链校验通过）后才回写健康度。
+                    // 纯 http 场景只完成 TCP 连通，证明不了该IP真正可用——
+                    // 此时既不上报成功（会把坏IP的惩罚值洗白）也不上报失败
+                    // （TCP 确实通了，判失败同样是冤枉），保持统计中性。
+                    if (fullyVerified)
+                    {
+                        this.domainResolver.ReportSuccess(context.DnsEndPoint, ipEndPoint.Address);
+                    }
                     return stream;
                 }
                 catch (OperationCanceledException)
@@ -131,8 +163,15 @@ namespace FastGithub.Http
                 }
             }
 
+            if (innerExceptions.Count == 0)
+            {
+                // 走到这里说明连一个候选IP都没拿到（域名解析为空），不是连接超时。
+                // 语义上区别于 HttpConnectTimeoutException，否则上层无法区分两种故障。
+                innerExceptions.Add(new InvalidOperationException($"{context.DnsEndPoint.Host} 未能解析到任何可用ip"));
+            }
+
             // 找不到任何可成功连接的IP时，自动触发IP更新，便于下次请求恢复
-            _ = this.RefreshIpAsync();
+            _ = this.RefreshIpAsync(context.DnsEndPoint.Host);
             throw new AggregateException("找不到任何可成功连接的IP，已自动触发IP更新，请稍后重试", innerExceptions);
         }
 
@@ -141,10 +180,12 @@ namespace FastGithub.Http
         /// 后台执行，不阻塞当前请求；使用静态令牌避免并发重复刷新
         /// </summary>
         /// <returns></returns>
-        private async Task RefreshIpAsync()
+        private async Task RefreshIpAsync(string host)
         {
-            if (Interlocked.Exchange(ref refreshingToken, 1) == 1)
+            var gate = refreshGates.GetOrAdd(host, _ => new SemaphoreSlim(1, 1));
+            if (gate.Wait(0) == false)
             {
+                // 该域名已有刷新在进行，避免重复触发
                 return;
             }
 
@@ -157,7 +198,7 @@ namespace FastGithub.Http
             }
             finally
             {
-                Interlocked.Exchange(ref refreshingToken, 0);
+                gate.Release();
             }
         }
 
@@ -167,8 +208,15 @@ namespace FastGithub.Http
         /// <param name="context"></param>
         /// <param name="ipEndPoint"></param>
         /// <param name="cancellationToken"></param>
-        /// <returns></returns>
-        private async ValueTask<Stream> ConnectAsync(SocketsHttpConnectionContext context, IPEndPoint ipEndPoint, CancellationToken cancellationToken)
+        /// <returns>
+        /// 数据流，以及一个标志：该连接是否已完成足以证明该IP可用的验证。
+        /// <para>
+        /// https 场景含 TLS 握手，证书链校验通过才算真正可用；
+        /// 纯 http 场景只做到 TCP 连通，此时该标志为 false——
+        /// 对端可能立刻 RST 或返回错误响应，把它算作成功会让坏IP长期停留在候选列表首位。
+        /// </para>
+        /// </returns>
+        private async ValueTask<(Stream Stream, bool FullyVerified)> ConnectAsync(SocketsHttpConnectionContext context, IPEndPoint ipEndPoint, CancellationToken cancellationToken)
         {
             var socket = new Socket(ipEndPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
             await socket.ConnectAsync(ipEndPoint, cancellationToken);
@@ -177,18 +225,23 @@ namespace FastGithub.Http
             var requestContext = context.InitialRequestMessage.GetRequestContext();
             if (requestContext.IsHttps == false)
             {
-                return stream;
+                return (stream, false);
             }
 
             var tlsSniValue = requestContext.TlsSniValue.WithIPAddress(ipEndPoint.Address);
             var sslStream = new SslStream(stream, leaveInnerStreamOpen: false);
+
+            // TLS 握手使用独立预算：TCP 已连通的情况下，
+            // 握手超时更可能意味着链路慢而非IP坏，不应与TCP失败同等对待
+            using var tlsTimeoutSource = new CancellationTokenSource(this.tlsHandshakeTimeout);
+            using var tlsToken = CancellationTokenSource.CreateLinkedTokenSource(tlsTimeoutSource.Token, cancellationToken);
             await sslStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
             {
                 TargetHost = tlsSniValue.Value,
                 RemoteCertificateValidationCallback = ValidateServerCertificate
-            }, cancellationToken);
+            }, tlsToken.Token);
 
-            return sslStream;
+            return (sslStream, true);
 
             // 验证证书有效性
             bool ValidateServerCertificate(object sender, X509Certificate? cert, X509Chain? chain, SslPolicyErrors errors)

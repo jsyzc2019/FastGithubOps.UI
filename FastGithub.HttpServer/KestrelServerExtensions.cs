@@ -44,6 +44,8 @@ namespace FastGithub
 
             if (GlobalListener.CanListenTcp(httpProxyPort) == false)
             {
+                // 先清状态再决定是抛异常还是降级，保证两条路径下读到的都是「未监听」
+                HttpProxyRuntimeState.ListenedPort = null;
                 var message = $"tcp端口{httpProxyPort}已经被其它进程占用，请在配置文件更换{nameof(FastGithubOptions.HttpProxyPort)}为其它端口";
                 if (throwOnPortOccupied == true)
                 {
@@ -64,6 +66,7 @@ namespace FastGithub
                 listen.Use(next => context => tunnelMiddleware.InvokeAsync(next, context));
             });
 
+            HttpProxyRuntimeState.ListenedPort = httpProxyPort;
             kestrel.GetLogger().LogInformation($"已监听 http://localhost:{httpProxyPort}，http代理服务启动完成");
         }
 

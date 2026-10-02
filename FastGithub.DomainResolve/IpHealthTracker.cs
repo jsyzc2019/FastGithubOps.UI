@@ -26,6 +26,20 @@ namespace FastGithub.DomainResolve
         /// </summary>
         private const int MAX_STATES = 4096;
 
+        /// <summary>
+        /// 统计值衰减系数。
+        /// <para>
+        /// 每次上报前把 <see cref="IpState.Total"/> 与 <see cref="IpState.Error"/> 各乘以该系数，
+        /// 使成功率成为「近N次」的有效统计而不是生命周期累计值。
+        /// </para>
+        /// <para>
+        /// 若不衰减，一次偶发失败（例如 TLS 握手超时）会让该IP的惩罚值永久居高不下，
+        /// 由于排序是 <c>OrderBy</c> 字典序（惩罚项优先于时延项），
+        /// 好的IP会被永久排到后面，排序逐渐退化成「偏好最新出现的IP」。
+        /// </para>
+        /// </summary>
+        private const double DECAY = 0.9d;
+
         private sealed class IpState
         {
             public int Total;
@@ -38,9 +52,14 @@ namespace FastGithub.DomainResolve
         private readonly ConcurrentDictionary<string, IpState> states = new();
 
         /// <summary>
-        /// 连续失败达到该次数即拉黑（dev-sidecar 取 1：坏IP不值得让用户多等几轮超时）
+        /// 连续失败达到该次数即拉黑。
+        /// <para>
+        /// dev-sidecar 取 1，但那是「宁可立刻换IP」的激进策略；
+        /// 本项目默认放宽到 2，避免单次网络抖动（WiFi 瞬断、网关重启）
+        /// 直接把一个域名的全部候选IP一次性拉黑。
+        /// </para>
         /// </summary>
-        public int KeepErrorThreshold { get; set; } = 1;
+        public int KeepErrorThreshold { get; set; } = 2;
 
         /// <summary>
         /// 成功率低于该值即拉黑
@@ -67,12 +86,15 @@ namespace FastGithub.DomainResolve
             var state = this.states.GetOrAdd(GetKey(host, address), _ => new IpState());
             lock (state)
             {
+                // 先衰减历史统计，让本次成功能逐步抵销过去的失败
+                Decay(state);
                 state.Total++;
                 state.KeepErrorCount = 0;
                 state.LastAccess = DateTime.UtcNow;
                 // 成功后立即解除拉黑，让好IP尽快回到可用列表
                 state.BlacklistUntil = DateTime.MinValue;
             }
+            this.TrimIfRequired();
         }
 
         /// <summary>
@@ -85,6 +107,7 @@ namespace FastGithub.DomainResolve
             var state = this.states.GetOrAdd(GetKey(host, address), _ => new IpState());
             lock (state)
             {
+                Decay(state);
                 state.Total++;
                 state.Error++;
                 state.KeepErrorCount++;
@@ -174,6 +197,15 @@ namespace FastGithub.DomainResolve
         }
 
         /// <summary>
+        /// 统计值衰减：让成功率成为「近N次」的有效统计而非生命周期累计值
+        /// </summary>
+        private static void Decay(IpState state)
+        {
+            state.Total = (int)(state.Total * DECAY);
+            state.Error = (int)(state.Error * DECAY);
+        }
+
+        /// <summary>
         /// 超出上限时清理最久未访问的条目
         /// </summary>
         private void TrimIfRequired()
@@ -183,14 +215,16 @@ namespace FastGithub.DomainResolve
                 return;
             }
 
-            var expired = this.states
-                .Where(item => item.Value.BlacklistUntil <= DateTime.UtcNow)
+            // 按最久未访问清理，不排除正在拉黑的条目。
+            // 失败风暴时绝大多数条目都处于拉黑状态，若按「未拉黑」过滤，
+            // trim 恰好会在最需要它的时候什么都不删，状态表会持续膨胀。
+            var victims = this.states
                 .OrderBy(item => item.Value.LastAccess)
                 .Take(MAX_STATES / 4)
                 .Select(item => item.Key)
                 .ToArray();
 
-            foreach (var key in expired)
+            foreach (var key in victims)
             {
                 this.states.TryRemove(key, out _);
             }

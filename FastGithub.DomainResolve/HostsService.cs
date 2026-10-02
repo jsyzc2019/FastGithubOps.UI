@@ -1,4 +1,6 @@
+using FastGithub.Configuration;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -16,18 +18,26 @@ namespace FastGithub.DomainResolve
     /// </summary>
     sealed class HostsService
     {
-        private const string DEFAULT_HOSTS_URL = "https://raw.hellogithub.com/hosts";
-
         private readonly HttpClient httpClient;
+        private readonly IOptionsMonitor<FastGithubOptions> options;
         private readonly ILogger<HostsService> logger;
         private readonly ConcurrentDictionary<string, IReadOnlyList<IPAddress>> mapping = new();
 
         /// <summary>
+        /// 连续失败次数，用于在源长期不可用时给出明确告警而非静默失效
+        /// </summary>
+        private int consecutiveFailures;
+
+        /// <summary>
         /// 在线hosts源解析服务
         /// </summary>
+        /// <param name="options"></param>
         /// <param name="logger"></param>
-        public HostsService(ILogger<HostsService> logger)
+        public HostsService(
+            IOptionsMonitor<FastGithubOptions> options,
+            ILogger<HostsService> logger)
         {
+            this.options = options;
             this.logger = logger;
             this.httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(10d) };
         }
@@ -39,9 +49,20 @@ namespace FastGithub.DomainResolve
         /// <returns></returns>
         public async Task RefreshAsync(CancellationToken cancellationToken)
         {
+            var hostsUrl = this.options.CurrentValue.HostsUrl?.Trim();
+            if (string.IsNullOrEmpty(hostsUrl))
+            {
+                // 显式禁用在线hosts源，只依赖本机DNS解析
+                if (this.mapping.IsEmpty == false)
+                {
+                    this.mapping.Clear();
+                }
+                return;
+            }
+
             try
             {
-                var content = await this.httpClient.GetStringAsync(DEFAULT_HOSTS_URL, cancellationToken);
+                var content = await this.httpClient.GetStringAsync(hostsUrl, cancellationToken);
                 var map = Parse(content);
 
                 this.mapping.Clear();
@@ -49,11 +70,23 @@ namespace FastGithub.DomainResolve
                 {
                     this.mapping[item.Key] = item.Value;
                 }
+
+                this.consecutiveFailures = 0;
                 this.logger.LogInformation($"已更新在线hosts解析，共{this.mapping.Count}个域名");
             }
             catch (Exception ex)
             {
-                this.logger.LogWarning($"在线hosts源更新失败：{ex.Message}");
+                this.consecutiveFailures++;
+                this.logger.LogWarning($"在线hosts源更新失败（{hostsUrl}）：{ex.Message}");
+
+                if (this.consecutiveFailures == 3)
+                {
+                    this.logger.LogError(
+                        $"在线hosts源 {hostsUrl} 已连续 {this.consecutiveFailures} 次不可用。" +
+                        "该地址返回的内容会被本程序直接当作域名->IP映射使用，" +
+                        "请确认该域名仍由可信方长期维护；" +
+                        "如需更换或禁用，可在 appsettings.json 中设置 FastGithub:HostsUrl。");
+                }
             }
         }
 
