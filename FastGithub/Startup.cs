@@ -1,6 +1,7 @@
 using FastGithub.Configuration;
 using FastGithub.DomainResolve;
 using FastGithub.FlowAnalyze;
+using FastGithub.Diagnostics;
 using FastGithub.HttpServer.Certs;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -15,6 +16,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Text.Json;
 
@@ -113,6 +115,7 @@ namespace FastGithub
             services.AddHttpClient();
             services.AddReverseProxy();
             services.AddFlowAnalyze();
+            services.AddSingleton<ConnectivityProbe>();
             services.AddHostedService<AppHostedService>();
 
             if (OperatingSystem.IsWindows())
@@ -184,6 +187,31 @@ namespace FastGithub
 
                 context.Response.ContentType = "application/json;charset=utf-8";
                 return context.Response.WriteAsJsonAsync(report, context.RequestAborted);
+            });
+
+            // 实时连通性探测：主动对 GitHub 各域名做 TCP+TLS 握手并计时。
+            // 用来回答"现在到底通不通、走哪个IP最快"——健康度统计只反映历史成败，
+            // 无法反映当前链路质量，而判断"加速有没有生效"恰恰需要后者。
+            app.MapGet("/connectivity", async context =>
+            {
+                var probe = context.RequestServices.GetRequiredService<ConnectivityProbe>();
+
+                var hosts = ConnectivityProbe.DefaultHosts;
+                var requested = context.Request.Query["host"];
+                if (string.IsNullOrWhiteSpace(requested) == false)
+                {
+                    hosts = requested.ToString().Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                }
+
+                var results = await probe.ProbeAsync(hosts, context.RequestAborted);
+
+                context.Response.ContentType = "application/json;charset=utf-8";
+                await context.Response.WriteAsJsonAsync(new
+                {
+                    reachableCount = results.Count(item => item.Reachable),
+                    totalCount = results.Count,
+                    items = results
+                }, context.RequestAborted);
             });
         }
     }
