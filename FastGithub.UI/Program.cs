@@ -105,13 +105,19 @@ namespace FastGithub.UI
             var fastgithubPath = FindFastGithubPath();
             if (fastgithubPath == null)
             {
+                // 原实现静默返回，用户看到的现象是"双击没反应"，无法判断是缺文件还是崩溃。
+                System.Windows.MessageBox.Show(
+                    $"未找到 {FASTGITHUB_PATH}，请确认它与 FastGithub.UI.exe 在同一目录下。",
+                    "FastGithub",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
                 return;
             }
 
             var startInfo = new ProcessStartInfo
             {
                 FileName = fastgithubPath,
-                Arguments = $"--ParentProcessId={Process.GetCurrentProcess().Id} --UdpLoggerPort={UdpLogger.Port}",
+                Arguments = $"--ParentProcessId={Process.GetCurrentProcess().Id} --UdpLoggerPort={UdpLogger.Port} --UiHttpPort={AppPorts.UiHttpPort}",
                 UseShellExecute = false,
                 CreateNoWindow = true
             };
@@ -132,7 +138,9 @@ namespace FastGithub.UI
                 return localPath;
             }
 
-            // 开发环境：向上查找FastGithub项目输出目录
+            // 开发环境：向上查找FastGithub项目输出目录。
+            // 目标框架随 Directory.Build.props 走，这里枚举 net* 目录而不是写死版本，
+            // 避免框架升级后这条路径再次失效。
             var searchDir = baseDir;
             for (var i = 0; i < 10; i++)
             {
@@ -142,16 +150,31 @@ namespace FastGithub.UI
                     break;
                 }
 
-                var devPath = Path.Combine(searchDir, "FastGithub", "bin", "Debug", "net7.0", "win-x64", FASTGITHUB_PATH);
-                if (File.Exists(devPath))
+                var projectBin = Path.Combine(searchDir, "FastGithub", "bin");
+                if (Directory.Exists(projectBin) == false)
                 {
-                    return devPath;
+                    continue;
                 }
 
-                devPath = Path.Combine(searchDir, "FastGithub", "bin", "Release", "net7.0", "win-x64", FASTGITHUB_PATH);
-                if (File.Exists(devPath))
+                foreach (var configuration in new[] { "Debug", "Release" })
                 {
-                    return devPath;
+                    var configurationDir = Path.Combine(projectBin, configuration);
+                    if (Directory.Exists(configurationDir) == false)
+                    {
+                        continue;
+                    }
+
+                    foreach (var frameworkDir in Directory.GetDirectories(configurationDir, "net*"))
+                    {
+                        foreach (var candidate in Directory.GetDirectories(frameworkDir))
+                        {
+                            var devPath = Path.Combine(candidate, FASTGITHUB_PATH);
+                            if (File.Exists(devPath))
+                            {
+                                return devPath;
+                            }
+                        }
+                    }
                 }
             }
 

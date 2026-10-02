@@ -1,12 +1,14 @@
 using FastGithub.Configuration;
 using FastGithub.DomainResolve;
 using FastGithub.FlowAnalyze;
+using FastGithub.HttpServer.Certs;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
 using Serilog;
 using Serilog.Sinks.Network;
 using System;
@@ -146,6 +148,42 @@ namespace FastGithub
                 await resolver.RefreshHostsAsync(context.RequestAborted);
                 context.Response.ContentType = "text/plain;charset=utf-8";
                 await context.Response.WriteAsync("IP更新已触发");
+            });
+
+            // 诊断：一次看清"证书是否真的被信任"与"IP健康度闭环是否在工作"。
+            // 这两个状态失效时的外部表现都只是"网络不好"，没有这个端点就只能靠猜。
+            app.MapGet("/diagnostics", context =>
+            {
+                var certService = context.RequestServices.GetRequiredService<CertService>();
+                var resolver = context.RequestServices.GetRequiredService<IDomainResolver>();
+                var options = context.RequestServices.GetRequiredService<IOptions<AppOptions>>().Value;
+
+                var report = new Dictionary<string, object?>
+                {
+                    ["caCert"] = new
+                    {
+                        path = certService.CaCerFilePath,
+                        trusted = certService.CheckCaCertTrusted()
+                    },
+                    ["listeners"] = new
+                    {
+                        uiHttpPort = GlobalListener.UiHttpPort,
+                        udpLoggerPort = options.UdpLoggerPort,
+                        httpPort = GlobalListener.HttpPort,
+                        httpsPort = GlobalListener.HttpsPort,
+                        sshPort = GlobalListener.SshPort,
+                        gitPort = GlobalListener.GitPort,
+                        httpProxyPort = Configuration.HttpProxyRuntimeState.ListenedPort
+                    },
+                    ["ipHealth"] = new
+                    {
+                        unhealthyCount = resolver.GetIpHealth(includeHealthy: false, maxCount: int.MaxValue).Count,
+                        items = resolver.GetIpHealth(includeHealthy: false, maxCount: 30)
+                    }
+                };
+
+                context.Response.ContentType = "application/json;charset=utf-8";
+                return context.Response.WriteAsJsonAsync(report, context.RequestAborted);
             });
         }
     }

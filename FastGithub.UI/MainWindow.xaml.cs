@@ -74,7 +74,16 @@ namespace FastGithub.UI
             try
             {
                 using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(10d) };
-                await httpClient.GetAsync("http://localhost:45678/refresh-ip");
+                var response = await httpClient.GetAsync($"{AppPorts.UiHttpBaseUrl}/refresh-ip");
+                var message = await response.Content.ReadAsStringAsync();
+
+                // 主程序未运行时给出明确指引，而不是抛一句 IsSuccessStatusCode 的通用错误
+                if (response.IsSuccessStatusCode == false)
+                {
+                    this.notifyIcon.ShowBalloonTip(3000, FASTGITHUB_UI, $"IP更新失败：{message}", System.Windows.Forms.ToolTipIcon.Error);
+                    return;
+                }
+
                 this.notifyIcon.ShowBalloonTip(3000, FASTGITHUB_UI, "已发送IP更新请求，正在重新解析", System.Windows.Forms.ToolTipIcon.Info);
             }
             catch (Exception ex)

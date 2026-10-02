@@ -15,7 +15,7 @@ namespace FastGithub.HttpServer.Certs
     /// <summary>
     /// 证书服务
     /// </summary>
-    sealed class CertService
+    public sealed class CertService
     {
         private const string CACERT_PATH = "cacert";
         private readonly IMemoryCache serverCertCache;
@@ -88,13 +88,37 @@ namespace FastGithub.HttpServer.Certs
             if (installer != null)
             {
                 installer.Install(this.CaCerFilePath);
+                this.CaCertTrusted = installer.IsTrusted(this.CaCerFilePath);
             }
             else
             {
                 this.logger.LogWarning($"请根据你的系统平台手动安装和信任CA证书{this.CaCerFilePath}");
+                this.CaCertTrusted = null;
             }
 
             GitConfigSslverify(false);
+        }
+
+        /// <summary>
+        /// 获取CA证书是否已被系统信任。
+        /// null 表示当前平台无法自动判定。供诊断端点与启动自检使用。
+        /// </summary>
+        public bool? CaCertTrusted { get; private set; }
+
+        /// <summary>
+        /// 重新检测CA证书信任状态
+        /// </summary>
+        /// <returns></returns>
+        public bool? CheckCaCertTrusted()
+        {
+            var installer = this.certInstallers.FirstOrDefault(item => item.IsSupported());
+            if (installer == null)
+            {
+                return null;
+            }
+
+            this.CaCertTrusted = installer.IsTrusted(this.CaCerFilePath);
+            return this.CaCertTrusted;
         }
 
         /// <summary>

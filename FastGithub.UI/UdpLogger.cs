@@ -17,7 +17,7 @@ namespace FastGithub.UI
         /// <summary>
         /// 获取日志端口
         /// </summary>
-        public static int Port { get; } = GetAvailableUdpPort(38457);
+        public static int Port { get; } = GetAvailableUdpPort(AppPorts.UdpLoggerPortBase);
 
 
         static UdpLogger()

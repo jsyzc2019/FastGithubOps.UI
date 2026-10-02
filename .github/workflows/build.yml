@@ -8,7 +8,9 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # 当前阶段只维护 win-x64：主程序依赖 WinDivert 做透明拦截，
+    # UI 是 net45 WPF，两者都只能在 Windows 上构建。
+    runs-on: windows-latest
 
     steps:
     - uses: actions/checkout@v4
@@ -28,21 +30,8 @@ jobs:
     # `dotnet test` 在找不到测试项目时返回退出码 1 会使 job 失败，
     # 因此不执行。将来补充测试工程后再把该步骤加回来。
 
-  build-multi-platform:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        include:
-          - os: ubuntu-latest
-            runtime: linux-x64
-            artifact-name: fastgithub-linux-x64
-          - os: windows-latest
-            runtime: win-x64
-            artifact-name: fastgithub-win-x64
-          - os: macos-latest
-            runtime: osx-x64
-            artifact-name: fastgithub-osx-x64
+  publish-win-x64:
+    runs-on: windows-latest
 
     steps:
     - uses: actions/checkout@v4
@@ -52,34 +41,46 @@ jobs:
       with:
         dotnet-version: '10.0.x'
 
-    - name: Build for ${{ matrix.os }}
+    - name: Publish main program
+      # 不要加 -p:PublishTrimmed=true。YARP/ASP.NET Core 依赖运行时反射，
+      # 裁剪后会在运行期抛 MissingMethod/TypeLoadException。
       run: |
-        dotnet restore FastGithub.sln
-        dotnet build FastGithub.sln --configuration Release
+        dotnet publish FastGithub/FastGithub.csproj `
+          -c Release `
+          -r win-x64 `
+          --self-contained true `
+          -p:PublishSingleFile=true `
+          -o ./publish/win-x64
 
-    - name: Publish single-file artifacts with UI
+    - name: Publish UI into the same directory
+      # 必须与主程序输出到同一目录。UI 运行时按同目录查找 fastgithub.exe，
+      # 分目录发布会导致 UI 及其 .config 在打包时被整体漏掉（v2.4.1 的实际问题）。
+      run: |
+        dotnet publish FastGithub.UI/FastGithub.UI.csproj `
+          -c Release `
+          -o ./publish/win-x64
+
+    - name: Verify published files
+      # 发布后立刻校验关键文件齐全，避免再次产出缺文件的包
       shell: bash
       run: |
-        # 发布主程序
-        # 注意：不要加 -p:PublishTrimmed=true。YARP/ASP.NET Core 依赖运行时反射，
-        # 裁剪后会在运行期抛 MissingMethod/TypeLoadException；
-        # 已验证的产物（v2.4.0 win-x64）同样未经裁剪，保持一致。
-        dotnet publish FastGithub/FastGithub.csproj \
-          -c Release \
-          -r ${{ matrix.runtime }} \
-          --self-contained true \
-          -p:PublishSingleFile=true \
-          -o ./publish/${{ matrix.runtime }}
-
-        # 发布 UI (仅 Windows)
-        if [ "${{ matrix.runtime }}" == "win-x64" ]; then
-          dotnet publish FastGithub.UI/FastGithub.UI.csproj \
-            -c Release \
-            -o ./publish/${{ matrix.runtime }}
+        set -euo pipefail
+        cd ./publish/win-x64
+        missing=0
+        for f in fastgithub.exe FastGithub.UI.exe FastGithub.UI.exe.config appsettings.json; do
+          if [ ! -f "$f" ]; then
+            echo "::error::缺少发布文件: $f"
+            missing=1
+          fi
+        done
+        if [ "$missing" -ne 0 ]; then
+          exit 1
         fi
+        echo "发布文件校验通过"
+        ls -la
 
-    - name: Upload artifacts
+    - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ matrix.artifact-name }}
-        path: ./publish/${{ matrix.runtime }}
+        name: fastgithub-win-x64
+        path: ./publish/win-x64

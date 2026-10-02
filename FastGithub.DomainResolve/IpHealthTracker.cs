@@ -206,6 +206,92 @@ namespace FastGithub.DomainResolve
         }
 
         /// <summary>
+        /// 获取全部状态的只读快照。
+        /// <para>
+        /// 修复闭环加上了，但如果看不到内部状态就无法确认它是否真的在工作：
+        /// 本轮的实际情况是"IP健康度"一旦静默失效，外部表现和"网络不好"完全一样。
+        /// 这里对外暴露快照，供诊断端点与日志使用。
+        /// </para>
+        /// </summary>
+        /// <param name="includeHealthy">是否包含健康条目（false 时只返回被拉黑或有过失败的）</param>
+        /// <param name="maxCount">最多返回多少条</param>
+        /// <returns></returns>
+        public IReadOnlyList<IpHealthSnapshot> GetSnapshots(bool includeHealthy = true, int maxCount = 200)
+        {
+            var now = DateTime.UtcNow;
+            var list = new List<IpHealthSnapshot>(Math.Min(this.states.Count, maxCount));
+
+            foreach (var item in this.states)
+            {
+                var state = item.Value;
+                int total, error, keepErrorCount;
+                DateTime blacklistUntil;
+                lock (state)
+                {
+                    total = state.Total;
+                    error = state.Error;
+                    keepErrorCount = state.KeepErrorCount;
+                    blacklistUntil = state.BlacklistUntil;
+                }
+
+                var blacklisted = blacklistUntil > now;
+                if (includeHealthy == false && blacklisted == false && error == 0)
+                {
+                    continue;
+                }
+
+                var separator = item.Key.LastIndexOf('|');
+                var host = separator > 0 ? item.Key[..separator] : item.Key;
+                var address = separator > 0 ? item.Key[(separator + 1)..] : string.Empty;
+
+                list.Add(new IpHealthSnapshot
+                {
+                    Host = host,
+                    Address = address,
+                    Total = total,
+                    Error = error,
+                    KeepErrorCount = keepErrorCount,
+                    SuccessRate = total > 0 ? 1d - (double)error / total : 1d,
+                    Blacklisted = blacklisted,
+                    BlacklistRemainingSeconds = blacklisted ? (int)Math.Ceiling((blacklistUntil - now).TotalSeconds) : 0
+                });
+            }
+
+            return list
+                .OrderByDescending(item => item.Blacklisted)
+                .ThenBy(item => item.SuccessRate)
+                .ThenBy(item => item.Host, StringComparer.Ordinal)
+                .Take(maxCount)
+                .ToArray();
+        }
+
+        /// <summary>
+        /// 获取状态条目总数
+        /// </summary>
+        public int Count => this.states.Count;
+
+        /// <summary>
+        /// 获取当前被拉黑的条目数
+        /// </summary>
+        /// <returns></returns>
+        public int GetBlacklistCount()
+        {
+            var now = DateTime.UtcNow;
+            var count = 0;
+            foreach (var state in this.states.Values)
+            {
+                lock (state)
+                {
+                    if (state.BlacklistUntil > now)
+                    {
+                        count++;
+                    }
+                }
+            }
+            return count;
+        }
+
+        /// <summary>
         /// 超出上限时清理最久未访问的条目
         /// </summary>
         private void TrimIfRequired()

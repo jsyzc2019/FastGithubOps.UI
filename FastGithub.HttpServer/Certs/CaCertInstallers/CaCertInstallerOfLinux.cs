@@ -73,6 +73,30 @@ namespace FastGithub.HttpServer.Certs.CaCertInstallers
                 File.Delete(destCertFilePath);
                 logger.LogWarning(ex.Message, "自动安装CA证书异常");
             }
+
+            if (this.IsTrusted(caCertFilePath) == false)
+            {
+                logger.LogError($"CA证书未被信任：{caCertFilePath}，部分依赖系统信任链的客户端将无法正常访问。请检查 {CaCertUpdatePath} 是否执行成功。");
+            }
+        }
+
+        /// <summary>
+        /// 校验ca证书是否已进入系统信任目录（内容一致才算成功）
+        /// </summary>
+        /// <param name="caCertFilePath"></param>
+        /// <returns></returns>
+        public bool IsTrusted(string caCertFilePath)
+        {
+            try
+            {
+                var destCertFilePath = Path.Combine(CaCertStorePath, Path.GetFileName(caCertFilePath));
+                return File.Exists(destCertFilePath)
+                    && File.ReadAllBytes(caCertFilePath).SequenceEqual(File.ReadAllBytes(destCertFilePath));
+            }
+            catch (Exception)
+            {
+                return false;
+            }
         }
     }
 }

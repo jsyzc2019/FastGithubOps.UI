@@ -361,3 +361,7 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+# 发布构建产物（附件通过 Release 分发，不入库）
+release_v*
+*.zip
+*.sha256

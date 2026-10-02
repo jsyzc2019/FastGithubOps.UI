@@ -218,5 +218,16 @@ namespace FastGithub.DomainResolve
             await this.hostsService.RefreshAsync(cancellationToken);
             await this.TestSpeedAsync(hostsOnly: true, cancellationToken);
         }
+
+        /// <summary>
+        /// 获取IP健康度快照
+        /// </summary>
+        /// <param name="includeHealthy">是否包含健康条目</param>
+        /// <param name="maxCount">最大条数</param>
+        /// <returns></returns>
+        public IReadOnlyList<IpHealthSnapshot> GetIpHealth(bool includeHealthy = true, int maxCount = 200)
+        {
+            return this.healthTracker.GetSnapshots(includeHealthy, maxCount);
+        }
     }
 }

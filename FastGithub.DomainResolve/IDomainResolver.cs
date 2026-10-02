@@ -38,5 +38,15 @@ namespace FastGithub.DomainResolve
         /// <param name="cancellationToken"></param>
         /// <returns></returns>
         Task RefreshHostsAsync(CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// 获取IP健康度快照。
+        /// 没有这个视图时，健康度反馈是否生效无法从外部判断——
+        /// 失效的表现和"网络本来就差"完全一样。
+        /// </summary>
+        /// <param name="includeHealthy">是否包含健康条目</param>
+        /// <param name="maxCount">最大条数</param>
+        /// <returns></returns>
+        IReadOnlyList<IpHealthSnapshot> GetIpHealth(bool includeHealthy = true, int maxCount = 200);
     }
 }

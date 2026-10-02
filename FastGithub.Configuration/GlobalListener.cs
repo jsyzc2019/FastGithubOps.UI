@@ -10,6 +10,13 @@ namespace FastGithub.Configuration
     /// </summary>
     public static class GlobalListener
     {
+        /// <summary>
+        /// UI内部通信端口的起始值
+        /// </summary>
+        public const int UiHttpPortBase = 45678;
+
+        private static int? uiHttpPort;
+
         private static readonly IPGlobalProperties global = IPGlobalProperties.GetIPGlobalProperties();
         private static readonly HashSet<int> tcpListenPorts = GetListenPorts(global.GetActiveTcpListeners);
         private static readonly HashSet<int> udpListenPorts = GetListenPorts(global.GetActiveUdpListeners);
@@ -37,7 +44,22 @@ namespace FastGithub.Configuration
         /// <summary>
         /// UI内部通信端口
         /// </summary>
-        public static int UiHttpPort { get; } = GetAvailableTcpPort(45678);
+        public static int UiHttpPort
+        {
+            get => uiHttpPort ?? GetAvailableTcpPort(UiHttpPortBase);
+        }
+
+        /// <summary>
+        /// 设置UI内部通信端口。
+        /// 由UI进程通过命令行传入，两端必须使用同一个端口：
+        /// 主程序若自行动态选端口（原实现），45678 被占用时会静默换到 45679，
+        /// 而UI仍硬编码访问 45678，结果是流量图表停更、"更新IP"永久失败且无从排查。
+        /// </summary>
+        /// <param name="port"></param>
+        public static void SetUiHttpPort(int port)
+        {
+            uiHttpPort = port;
+        }
 
         /// <summary>
         /// 获取已监听的端口
