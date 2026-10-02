@@ -35,6 +35,10 @@ namespace FastGithub.Http
         // 并发赛马中后续候选的错开间隔（RFC 8305 Happy Eyeballs）
         private static readonly TimeSpan RACE_STAGGER = TimeSpan.FromMilliseconds(250d);
 
+        // 并发赛马的候选上限。候选来自 hosts源 + DNS 补充，数量可能不少；
+        // 全部并发会同时打出大量握手，而排序靠后的多是劣质IP，不值得为它们建连。
+        private const int MAX_RACE_COUNT = 4;
+
         // 刷新闸门按域名隔离。
         // 原实现是一个全局 static 令牌，任意域名触发刷新会让其他域名
         // 在最长10秒（hosts源HTTP超时）内无法通过该路径恢复。
@@ -162,7 +166,11 @@ namespace FastGithub.Http
             using var raceTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             var pending = new List<Task<(IPEndPoint EndPoint, Stream? Stream, bool Verified, Exception? Error)>>();
 
-            for (var i = 0; i < candidates.Count; i++)
+            // 候选可能很多（hosts源 + DNS 补充），全部并发会同时打出大量握手。
+            // 取前面若干个即可：排序已按健康度与时延排过，后面的多是劣质IP。
+            var raceCandidates = candidates.Take(MAX_RACE_COUNT).ToArray();
+
+            for (var i = 0; i < raceCandidates.Length; i++)
             {
                 // 首个立即发起，其余错开 ~250ms（RFC 8305）。
                 // 全部同时打出去会在链路拥塞时互相拖慢，错开后通常第一个就能成功，
@@ -178,7 +186,7 @@ namespace FastGithub.Http
                         break;
                     }
                 }
-                pending.Add(this.RaceConnectAsync(context, ipEndPoint: candidates[i], raceTokenSource.Token));
+                pending.Add(this.RaceConnectAsync(context, ipEndPoint: raceCandidates[i], raceTokenSource.Token));
             }
 
             try

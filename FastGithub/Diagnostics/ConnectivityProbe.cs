@@ -127,7 +127,7 @@ namespace FastGithub.Diagnostics
                 Reachable = winner != null,
                 TotalIpCount = addresses.Count,
                 FailedIpCount = failures,
-                Address = winner?.Address.ToString(),
+                Address = winner?.Address?.ToString(),
                 HandshakeMs = winner?.ElapsedMs,
                 ElapsedMs = (long)stopWatch.Elapsed.TotalMilliseconds,
                 Error = winner == null ? $"{addresses.Count} 个候选IP均不可用" : null

@@ -74,7 +74,12 @@ namespace FastGithub.DomainResolve
         {
             var hashSet = new HashSet<IPAddress>();
 
-            // 在线hosts源覆盖的域名仅使用hosts源提供的IP，不混入DNS结果
+            // 在线hosts源提供的IP优先返回（它们经过源站筛选，质量最可靠）。
+            // 原实现在这里直接 yield break，导致被hosts源覆盖的域名永远只有
+            // 源里那一个候选IP——它一旦被干扰或故障，连接层没有任何备选可退，
+            // "并发赛马"与"健康度排序"全都失效，只剩单点。
+            // 改为继续用DNS结果补充：DNS污染段已由 IpAddressFilter 过滤，
+            // 且所有候选都要过 TCP+TLS 探测才会被真正使用，混入不会引入坏IP。
             if (this.hostsService.TryGetAddresses(endPoint.Host, out var hostsAddresses) && hostsAddresses.Count > 0)
             {
                 foreach (var address in hostsAddresses)
@@ -84,11 +89,14 @@ namespace FastGithub.DomainResolve
                         yield return address;
                     }
                 }
-                yield break;
-            }
 
-            // 手动刷新仅使用在线hosts源，未覆盖的域名不发起DNS查询
-            if (hostsOnly == true)
+                // 手动刷新仅使用在线hosts源，未覆盖的域名不发起DNS查询
+                if (hostsOnly == true)
+                {
+                    yield break;
+                }
+            }
+            else if (hostsOnly == true)
             {
                 yield break;
             }
