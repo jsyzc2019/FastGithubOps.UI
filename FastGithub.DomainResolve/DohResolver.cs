@@ -2,10 +2,12 @@ using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -27,6 +29,11 @@ namespace FastGithub.DomainResolve
     sealed class DohResolver
     {
         /// <summary>
+        /// DoH 端点熔断状态的落盘文件名（工作目录下，与 dnsendpoints.json 同级）。
+        /// </summary>
+        private static readonly string blockedFile = "doh_blocked_endpoints.json";
+
+        /// <summary>
         /// 正查询缓存时长：成功的 DoH 结果会被复用，避免后台每秒一次的测速把 DoH 打爆。
         /// <para>
         /// 取 10 分钟而非更短：GitHub 边缘 IP 本身很稳定，缓存过短会让候选 IP 频繁漂移
@@ -43,6 +50,26 @@ namespace FastGithub.DomainResolve
         /// 导致所有端点均不可用。放宽到 12s 留足余量；端点级还有重试兜底。
         /// </summary>
         private static readonly TimeSpan perRequestTimeout = TimeSpan.FromSeconds(12d);
+
+        /// <summary>
+        /// 端点熔断：连续失败达到该次数后，暂停使用该端点 <see cref="endpointCooldown"/>。
+        /// <para>
+        /// 【为什么必须熔断】端点列表是"按序遍历、命中即止"，这在**所有端点都健康**时最优
+        /// （只打扰第一个）。但现实中常有部分端点被墙/被限速：实测本机
+        /// 223.5.5.5 仅 98~237ms，而 119.29.29.29 与 1.1.1.1 **稳定 10 秒超时**。
+        /// 一旦排在前面的端点失手，串行遍历会把后面每个端点的
+        /// perRequestTimeout×重试 全部等完（最坏 4 端点 × 12s × 2 次 = 96s），
+        /// 单个域名的解析被拖到几十秒，而上层请求的 Timeout 只有 25s —— 直接 504。
+        /// 熔断后失效端点会被跳过，只保留真正可达的端点，
+        /// 解析耗时回落到"最快可达端点"的量级，且**不增加任何额外请求流量**。
+        /// </para>
+        /// </summary>
+        private const int endpointFailureThreshold = 2;
+
+        /// <summary>
+        /// 熔断后的冷却时长：给被墙端点恢复的机会，同时不至于让一次网络抖动就长期弃用端点。
+        /// </summary>
+        private static readonly TimeSpan endpointCooldown = TimeSpan.FromMinutes(10d);
 
         /// <summary>
         /// 使用 IP 字面量（而非域名）作为 DoH 端点，使客户端无需先解析域名，
@@ -64,6 +91,23 @@ namespace FastGithub.DomainResolve
         private readonly ConcurrentDictionary<string, (DateTime Expires, IReadOnlyList<IPAddress> Addresses)> positiveCache = new();
 
         /// <summary>
+        /// 同一 host 的并发解析合流（single-flight）。
+        /// <para>
+        /// 【v2.6.2 修正】正缓存是"查完才写"，冷启动时几十个请求同时问同一个域名，
+        /// 会在缓存写入前全部落空并各自发起一次完整 DoH 查询。
+        /// 实测 v2.6.2 日志：api.github.com 在 60 秒内被解析 15 次（另有 github.com 4 次），
+        /// 这些重复查询既白耗跨境带宽，也让 DoH 端点更早触发风控。
+        /// 用 inflight 字典让后来者直接复用首个请求的 Task，查询次数从 N 降为 1。
+        /// </para>
+        /// </summary>
+        private readonly ConcurrentDictionary<string, Task<IReadOnlyList<IPAddress>>> inflight = new();
+
+        /// <summary>
+        /// 各 DoH 端点的熔断状态：值为 (连续失败次数, 熔断至何时)。
+        /// </summary>
+        private readonly ConcurrentDictionary<string, (int Failures, DateTime BlockedUntil)> endpointHealth = new();
+
+        /// <summary>
         /// DoH 解析器
         /// </summary>
         public DohResolver(ILogger<DohResolver> logger)
@@ -77,6 +121,64 @@ namespace FastGithub.DomainResolve
             {
                 Timeout = perRequestTimeout
             };
+
+            // 【跨进程继承熔断状态】程序往往连续运行数小时甚至跨重启，
+            // 而"哪些 DoH 端点被墙"是**网络环境属性**，不会因为重启而改变。
+            // 若每次启动都从零开始试探，Startup 的测速必然先被死端点吃掉几十秒，
+            // 这正是"刚启动那几分钟大量 504"的直接来源。
+            // 因此把熔断状态落盘（很小的文件），重启后直接跳过已知死端点。
+            try
+            {
+                if (File.Exists(blockedFile))
+                {
+                    var blocked = JsonSerializer.Deserialize<List<string>>(File.ReadAllText(blockedFile)) ?? new List<string>();
+                    var until = DateTime.UtcNow.Add(endpointCooldown);
+                    foreach (var endpoint in blocked)
+                    {
+                        if (Endpoints.Contains(endpoint, StringComparer.OrdinalIgnoreCase))
+                        {
+                            this.endpointHealth[endpoint] = (Failures: endpointFailureThreshold, BlockedUntil: until);
+                        }
+                    }
+
+                    if (blocked.Count > 0)
+                    {
+                        this.logger.LogWarning($"已从上次运行继承 {blocked.Count} 个不可用 DoH 端点的熔断状态（冷却 {endpointCooldown.TotalMinutes:F0} 分钟）：{string.Join(", ", blocked)}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                this.logger.LogDebug($"读取 DoH 端点熔断状态失败：{ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 把当前处于熔断期的端点写入磁盘，供下次启动继承。
+        /// </summary>
+        private void PersistEndpointHealth()
+        {
+            try
+            {
+                var now = DateTime.UtcNow;
+                var blocked = this.endpointHealth
+                    .Where(item => item.Value.BlockedUntil > now)
+                    .Select(item => item.Key)
+                    .ToArray();
+
+                if (blocked.Length > 0)
+                {
+                    File.WriteAllText(blockedFile, JsonSerializer.Serialize(blocked));
+                }
+                else if (File.Exists(blockedFile))
+                {
+                    File.Delete(blockedFile);
+                }
+            }
+            catch (Exception ex)
+            {
+                this.logger.LogDebug($"保存 DoH 端点熔断状态失败：{ex.Message}");
+            }
         }
 
         /// <summary>
@@ -90,6 +192,7 @@ namespace FastGithub.DomainResolve
         public void InvalidateCache()
         {
             this.positiveCache.Clear();
+            this.inflight.Clear();
         }
 
         /// <summary>
@@ -105,6 +208,26 @@ namespace FastGithub.DomainResolve
                 return cached.Addresses;
             }
 
+            // 【single-flight】同一 host 的并发查询合流为一次。
+            // 注意用 Task.Run 包装成"冷"任务再入字典：若直接用本协程的 Task，
+            // await 尚未完成时字典还没写入，并发者仍会各自发起查询（合流失效）。
+            var task = this.inflight.GetOrAdd(host, _ => Task.Run(
+                async () => await this.ResolveCoreAsync(host, cancellationToken),
+                CancellationToken.None));
+
+            try
+            {
+                return await task;
+            }
+            finally
+            {
+                // 只移除"自己登记的"那一个，避免误删后来者的新任务
+                this.inflight.TryRemove(new KeyValuePair<string, Task<IReadOnlyList<IPAddress>>>(host, task));
+            }
+        }
+
+        private async Task<IReadOnlyList<IPAddress>> ResolveCoreAsync(string host, CancellationToken cancellationToken)
+        {
             // A 与 AAAA 并行查询，合并结果
             var aTask = ResolveWireAsync(host, type: 1, cancellationToken);
             var aaaaTask = ResolveWireAsync(host, type: 28, cancellationToken);
@@ -174,6 +297,13 @@ namespace FastGithub.DomainResolve
         {
             foreach (var endpoint in endpoints)
             {
+                // 【熔断跳过】仍在冷却期内的端点直接不发起请求。
+                // 这既省掉每域名每次解析各 12~24s 的白等，也让"命中即止"在有死端点时不再退化成串行空等。
+                if (IsEndpointBlocked(endpoint))
+                {
+                    continue;
+                }
+
                 var addresses = await QueryEndpointWithRetryAsync(endpoint, dnsParam, cancellationToken);
                 foreach (var address in addresses)
                 {
@@ -182,6 +312,63 @@ namespace FastGithub.DomainResolve
                 if (sink.Count > 0)
                 {
                     break;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 该端点是否处于熔断冷却期
+        /// </summary>
+        private bool IsEndpointBlocked(string endpoint)
+        {
+            if (this.endpointHealth.TryGetValue(endpoint, out var health) == false)
+            {
+                return false;
+            }
+
+            if (health.BlockedUntil > DateTime.UtcNow)
+            {
+                return true;
+            }
+
+            // 冷却已过，给一次重新试探的机会（清零失败计数）
+            this.endpointHealth.TryUpdate(endpoint, (Failures: 0, BlockedUntil: DateTime.MinValue), health);
+            return false;
+        }
+
+        /// <summary>
+        /// 记录端点的成功/失败，连续失败达阈值则熔断
+        /// </summary>
+        private void ReportEndpointResult(string endpoint, bool success)
+        {
+            if (success)
+            {
+                if (this.endpointHealth.TryRemove(endpoint, out _))
+                {
+                    // 该端点曾被判死，现已恢复可用：清掉落盘记录，避免下次启动继续跳过它
+                    this.PersistEndpointHealth();
+                }
+                return;
+            }
+
+            var before = this.endpointHealth.TryGetValue(endpoint, out var current)
+                ? current
+                : (Failures: 0, BlockedUntil: DateTime.MinValue);
+
+            (int Failures, DateTime BlockedUntil) after = before.BlockedUntil > DateTime.UtcNow
+                // 已在冷却中，保持原有的剩余时长，不要被本次失败无限延长
+                ? before
+                : (before.Failures + 1, before.Failures + 1 >= endpointFailureThreshold
+                    ? DateTime.UtcNow.Add(endpointCooldown)
+                    : DateTime.MinValue);
+
+            if (this.endpointHealth.TryUpdate(endpoint, after, before))
+            {
+                // 新进入熔断时立即落盘（保证进程被杀/断电也不丢）
+                if (before.BlockedUntil <= DateTime.UtcNow && after.BlockedUntil > DateTime.UtcNow)
+                {
+                    this.PersistEndpointHealth();
+                    this.logger.LogWarning($"DoH 端点 {endpoint} 连续失败 {after.Failures} 次，已熔断 {endpointCooldown.TotalMinutes:F0} 分钟");
                 }
             }
         }
@@ -199,13 +386,23 @@ namespace FastGithub.DomainResolve
                 var result = await QueryEndpointAsync(endpoint, dnsParam, cancellationToken);
                 if (result.Count > 0)
                 {
+                    this.ReportEndpointResult(endpoint, success: true);
                     return result;
                 }
+
+                // 注意：被取消（停机）不算端点失败，否则一次正常关闭会把所有端点熔断 10 分钟。
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    return Array.Empty<IPAddress>();
+                }
+
                 if (attempt < maxTries - 1)
                 {
                     await Task.Delay(TimeSpan.FromMilliseconds(400d), cancellationToken);
                 }
             }
+
+            this.ReportEndpointResult(endpoint, success: false);
             return Array.Empty<IPAddress>();
         }
 

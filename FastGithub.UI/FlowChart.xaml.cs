@@ -49,10 +49,38 @@ namespace FastGithub.UI
             this.Series.Add(this.writeSeries);
 
             this.DataContext = this;
-            this.InitFlowChartAsync();
+
+            // 【关键修复】构造函数在 UI 线程同步执行，而 InitFlowChartAsync 内
+            // 第一处 await（HttpClient.GetAsync）之后的代码段运行在线程池线程。
+            // 原实现在那里直接写 this.textBlockRead.Text 与 readSeries.Values，
+            // 全是 WPF 依赖线程亲和性的对象：
+            //   - TextBlock 跨线程赋值抛 InvalidOperationException("该线程没有访问此对象")；
+            //   - LiveCharts 的 ChartValues 在非 UI 线程 Add 不会触发重绘，且可能抛线程异常。
+            // 一旦抛异常，async void 的异常无法被外层 catch 捕获，UI 上就表现为
+            // "流量图始终空白、连失败提示都没有"（服务端 /flowStatistics 实测返回 200 正常）。
+            // 改为 Loaded 事件触发（确保在 UI 线程且控件已加载完成），并在每次
+            // 写 UI 前用 Dispatcher.InvokeAsync 切回 UI 线程。
+            this.Loaded += async (sender, e) => await this.InitFlowChartAsync();
         }
 
-        private async void InitFlowChartAsync()
+        /// <summary>
+        /// 在 UI 线程上执行操作
+        /// </summary>
+        private void InvokeOnUi(Action action)
+        {
+            if (this.Dispatcher.CheckAccess() == false)
+            {
+                // 已关闭时不再排队，否则会抛 TaskCanceledException/InvalidOperationException
+                if (this.Dispatcher.HasShutdownStarted == false)
+                {
+                    this.Dispatcher.InvokeAsync(action);
+                }
+                return;
+            }
+            action();
+        }
+
+        private async Task InitFlowChartAsync()
         {
             var consecutiveFailures = 0;
             while (this.Dispatcher.HasShutdownStarted == false)
@@ -74,8 +102,12 @@ namespace FastGithub.UI
                     // 连续失败时降低提示频率（避免每刷一次刷屏）。
                     if (consecutiveFailures == 0 || consecutiveFailures % 30 == 0)
                     {
-                        this.textBlockRead.Text = "流量读取失败";
-                        this.textBlockWrite.Text = ex.GetType().Name;
+                        var message = ex.GetType().Name;
+                        this.InvokeOnUi(() =>
+                        {
+                            this.textBlockRead.Text = "流量读取失败";
+                            this.textBlockWrite.Text = message;
+                        });
                     }
                     consecutiveFailures++;
                 }
@@ -96,18 +128,23 @@ namespace FastGithub.UI
                 return;
             }
 
-            this.textBlockRead.Text = FlowStatistics.ToNetworkSizeString(flowStatistics.TotalRead);
-            this.textBlockWrite.Text = FlowStatistics.ToNetworkSizeString(flowStatistics.TotalWrite);
-
-            var timestamp = GetTimestamp(DateTime.Now);
-            this.readSeries.Values.Add(new RateTick(flowStatistics.ReadRate, timestamp));
-            this.writeSeries.Values.Add(new RateTick(flowStatistics.WriteRate, timestamp));
-
-            if (this.readSeries.Values.Count > 60)
+            // 【关键】await 之后已离开 UI 线程，所有 UI/图表写入必须切回 UI 线程，
+            // 否则 TextBlock 赋值抛线程异常、ChartValues.Add 不重绘（详见构造函数注释）。
+            this.InvokeOnUi(() =>
             {
-                this.readSeries.Values.RemoveAt(0);
-                this.writeSeries.Values.RemoveAt(0);
-            }
+                this.textBlockRead.Text = FlowStatistics.ToNetworkSizeString(flowStatistics.TotalRead);
+                this.textBlockWrite.Text = FlowStatistics.ToNetworkSizeString(flowStatistics.TotalWrite);
+
+                var timestamp = GetTimestamp(DateTime.Now);
+                this.readSeries.Values.Add(new RateTick(flowStatistics.ReadRate, timestamp));
+                this.writeSeries.Values.Add(new RateTick(flowStatistics.WriteRate, timestamp));
+
+                if (this.readSeries.Values.Count > 60)
+                {
+                    this.readSeries.Values.RemoveAt(0);
+                    this.writeSeries.Values.RemoveAt(0);
+                }
+            });
         }
 
         private class RateTick

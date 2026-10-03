@@ -9,6 +9,7 @@ using Microsoft.Extensions.Options;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
@@ -64,6 +65,17 @@ namespace FastGithub.DomainResolve
 
         private readonly int resolveTimeout = (int)TimeSpan.FromSeconds(4d).TotalMilliseconds;
         private static readonly TimeSpan tcpConnectTimeout = TimeSpan.FromSeconds(2d);
+
+        /// <summary>
+        /// 明文 DNS "假可达"的冷却时长。TCP 通但查询被 RST 属网络环境特性，
+        /// 短时间内无需再试；取 10 分钟与 DoH 正缓存同量级，也与端点熔断周期一致。
+        /// </summary>
+        private static readonly TimeSpan plainDnsBrokenCooldown = TimeSpan.FromMinutes(10d);
+
+        /// <summary>
+        /// 记录 (dns, 域名) 维度上"TCP 可达但查询被对端截断"，值为冷却截止时刻。
+        /// </summary>
+        private readonly ConcurrentDictionary<string, DateTime> plainDnsBroken = new();
 
         private record LookupResult(IList<IPAddress> Addresses, TimeSpan TimeToLive);
 
@@ -159,6 +171,13 @@ namespace FastGithub.DomainResolve
 
             await foreach (var dns in this.GetDnsServersAsync(cancellationToken))
             {
+                // 已知"TCP 通但查询被 RST"的明文 DNS：本轮直接跳过，
+                // 不让它在每个域名上白等 resolveTimeout × 2（A + AAAA）。
+                if (dns.Port == DNS_PORT && this.ShouldSkipPlainDns(dns, endPoint.Host))
+                {
+                    continue;
+                }
+
                 var addresses = await this.LookupAsync(dns, endPoint, fastSort, cancellationToken);
                 foreach (var address in addresses)
                 {
@@ -204,6 +223,62 @@ namespace FastGithub.DomainResolve
                     yield return dns;
                 }
             }
+        }
+
+        /// <summary>
+        /// 判断某个明文 DNS 是否已被证明「连得上但不响应查询」，据此跳过它。
+        /// <para>
+        /// 【关键背景】本机网络下明文 53 端口 DNS 是**典型的"假可达"**：
+        /// TCP 握手能成功（<see cref="IsDnsAvailableAsync"/> 因此判定可用），
+        /// 但发出查询后立刻被 RST（"远程主机强迫关闭了一个现有的连接"）。
+        /// 结果是每个域名都要在这条死路上白等 <see cref="resolveTimeout"/>（4s），
+        /// A + AAAA 两轮查询各自等满，单域名凭空多出 8s；
+        /// 而这8s 直接吃掉上层请求 25s 预算的一大块，是启动期 504 的帮凶之一。
+        /// <para>
+        /// 这里按 dns 服务器维度记住"TCP 通但查询失败"，一旦确认就在冷却期内跳过它，
+        /// 既省掉无谓的等待，也避免把被污染的 IP 混进候选池。
+        /// <para>
+        /// 【v2.6.2 修正】原实现按 (dns, 域名) 维度记录，等于**每个域名都要重新踩一次**：
+        /// 实测 v2.6.2 日志中 223.5.5.5 与 119.29.29.29 各被 RST 14 次，覆盖 14 个不同域名，
+        /// 熔断从未对第 2 个域名生效。因为"被 RST"是**该 DNS 服务器到本机链路**的属性，
+        /// 与问的是哪个域名无关，故改为按 dns 维度记录：第一个域名确认后，
+        /// 后续所有域名直接跳过，14 次重试降为 1 次。
+        /// </para>
+        /// 注意这只跳过**明文 DNS 查询**，DoH（443）完全不受影响。
+        /// </para>
+        /// </summary>
+        private bool ShouldSkipPlainDns(IPEndPoint dns, string host)
+        {
+            var key = dns.ToString();
+            if (this.plainDnsBroken.TryGetValue(key, out var until))
+            {
+                if (until > DateTime.UtcNow)
+                {
+                    return true;
+                }
+                this.plainDnsBroken.TryRemove(key, out _);
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// 标记某明文 DNS 服务器的查询被对端 RST/截断，进入冷却
+        /// </summary>
+        private void ReportPlainDnsBroken(IPEndPoint dns, string host, bool broken)
+        {
+            if (broken == false)
+            {
+                return;
+            }
+
+            var key = dns.ToString();
+            if (this.plainDnsBroken.TryGetValue(key, out var until) && until > DateTime.UtcNow)
+            {
+                // 已在冷却中，不延长剩余时长
+                return;
+            }
+
+            this.plainDnsBroken[key] = DateTime.UtcNow.Add(plainDnsBrokenCooldown);
         }
 
         /// <summary>
@@ -277,6 +352,16 @@ namespace FastGithub.DomainResolve
             catch (Exception ex)
             {
                 this.logger.LogWarning($"{endPoint.Host}@{dns}->{ex.Message}");
+
+                // 区分"这次查询失败"与"这个 DNS 根本不可用"：
+                // TCP 握手此前已成功（IsDnsAvailableAsync 判定可用），却在这一步被 RST /
+                // 意外断流，属于该网络下明文 53 端口的典型封锁特征，值得记住并跳过后续查询；
+                // 而 OperationCanceledException（超时取消）只是慢，不应判定为被封锁。
+                if (dns.Port == DNS_PORT && IsBlockedByPeer(ex))
+                {
+                    this.ReportPlainDnsBroken(dns, endPoint.Host, broken: true);
+                }
+
                 var expiration = IsSocketException(ex) ? this.maxTimeToLive : this.minTimeToLive;
                 return this.dnsLookupCache.Set(key, Array.Empty<IPAddress>(), expiration);
             }
@@ -300,6 +385,47 @@ namespace FastGithub.DomainResolve
 
             var inner = ex.InnerException;
             return inner != null && IsSocketException(inner);
+        }
+
+        /// <summary>
+        /// 判断异常是否为"对端主动截断连接"（RST / 意外断流）而非本地超时。
+        /// <para>
+        /// 这类异常说明链路本身通（能收到 TCP RST 或半包后被断开），
+        /// 只是明文 DNS 查询不被放行；与"连不上"（超时）和"慢"（取消）是三种不同故障，
+        /// 只有第一种适合进入熔断冷却。
+        /// </para>
+        /// </summary>
+        private static bool IsBlockedByPeer(Exception ex)
+        {
+            // 超时取消属于"慢"，不判定为被封锁
+            if (ex is OperationCanceledException || ex is TimeoutException)
+            {
+                return false;
+            }
+
+            if (ex is SocketException socketException)
+            {
+                var code = socketException.SocketErrorCode;
+                return code == SocketError.ConnectionReset
+                    || code == SocketError.ConnectionAborted
+                    || code == SocketError.Shutdown;
+            }
+
+            // IOException 家族："Unable to read data from the transport connection" /
+            // "Unexpected end of stream" 等，均为连接被中途截断的表现。
+            // 注意这类异常常被包在 AggregateException / TargetInvocationException 里，需递归下钻。
+            if (ex is AggregateException aggregate && aggregate.InnerExceptions.Count > 0)
+            {
+                return aggregate.InnerExceptions.Any(IsBlockedByPeer);
+            }
+
+            if (ex is IOException)
+            {
+                return true;
+            }
+
+            var inner = ex.InnerException;
+            return inner != null && IsBlockedByPeer(inner);
         }
 
 
