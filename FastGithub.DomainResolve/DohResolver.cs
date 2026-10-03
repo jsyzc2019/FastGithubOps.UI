@@ -34,7 +34,7 @@ namespace FastGithub.DomainResolve
         /// <summary>
         /// 单次 DoH 请求的整体预算
         /// </summary>
-        private static readonly TimeSpan perRequestTimeout = TimeSpan.FromSeconds(5d);
+        private static readonly TimeSpan perRequestTimeout = TimeSpan.FromSeconds(8d);
 
         /// <summary>
         /// 使用 IP 字面量（而非域名）作为 DoH 端点，使客户端无需先解析域名，

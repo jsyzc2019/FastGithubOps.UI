@@ -23,11 +23,13 @@ namespace FastGithub.Http
     {
         private readonly DomainConfig domainConfig;
         private readonly IDomainResolver domainResolver;
-        // 与 dev-sidecar 的 SpeedTester 对齐：单IP 5秒连不上就换下一个，
-        // 10秒会让"3个IP全坏"的最坏情况拖到30秒，用户体感就是卡死。
-        // 注意该预算只覆盖 TCP 建连：跨境链路的 TLS 握手（含证书链校验、
-        // 可能的 OCSP/CRL 回源）经常超过 5s，把两者压在同一预算内会误杀优质IP。
-        private readonly TimeSpan connectTimeout = TimeSpan.FromSeconds(5d);
+        // 单IP 建连预算。原值 5s 是在"串行逐个尝试"假设下定的：那时 3 个坏 IP 要干等 15 秒，
+        // 不敢给太长。现已改为并发赛马（取第一个胜出者、余者立即取消），最坏耗时从 N×超时 降到 1×超时，
+        // 放开到 10s 不会让用户卡死，却能覆盖跨境链路常见的高 RTT。
+        // 实测本机到 github.com:443 的 RTT 常达 5.3s（一条 502 响应就用了 5287ms），
+        // 5s 会把"慢但可用"的IP在 TCP 握手里直接判死。预算只覆盖 TCP 建连，
+        // TLS 握手另有独立预算（tlsHandshakeTimeout），二者压在同一数字上才会误杀优质IP。
+        private readonly TimeSpan connectTimeout = TimeSpan.FromSeconds(10d);
 
         // TLS 握手单独给一份更宽的预算，避免把"握手慢但服务正常"的IP判为坏IP
         private readonly TimeSpan tlsHandshakeTimeout = TimeSpan.FromSeconds(10d);

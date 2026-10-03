@@ -16,7 +16,7 @@ namespace FastGithub.DomainResolve
     /// IP服务
     /// 域名IP关系缓存10分钟
     /// IPEndPoint时延缓存5分钟
-    /// IPEndPoint连接超时5秒
+    /// IPEndPoint连接超时10秒
     /// </summary>
     sealed class IPAddressService
     {
@@ -27,7 +27,7 @@ namespace FastGithub.DomainResolve
         private record AddressElapsed(IPAddress Address, TimeSpan Elapsed);
         private readonly TimeSpan problemElapsedExpiration = TimeSpan.FromMinutes(1d);
         private readonly TimeSpan normalElapsedExpiration = TimeSpan.FromMinutes(5d);
-        private readonly TimeSpan connectTimeout = TimeSpan.FromSeconds(5d);
+        private readonly TimeSpan connectTimeout = TimeSpan.FromSeconds(10d);
 
         // TLS 探测的独立预算：TCP 已连通时握手慢更可能是链路慢而非 IP 坏，
         // 与 TCP 超时共用一份预算会把"慢但可用"的 IP 误杀。
@@ -106,9 +106,12 @@ namespace FastGithub.DomainResolve
                 .Where(item => item.Elapsed < TimeSpan.MaxValue)
                 .ToArray();
 
+            // 探测全部超时（多为"网络慢"而非"IP坏"，见上方 connectTimeout 已放宽到 10s）：
+            // 不立即判死刑。把所有候选交回上层，由 live connect（同样 10s 预算）再试一次，
+            // 否则一个慢网络瞬间就会变成"找不到任何可成功连接的IP"。
             if (connectable.Length == 0)
             {
-                return Array.Empty<IPAddress>();
+                connectable = addressElapseds;
             }
 
             // 被拉黑的IP直接剔除；若全部被拉黑则退化为按健康度排序，保证不会无IP可用
