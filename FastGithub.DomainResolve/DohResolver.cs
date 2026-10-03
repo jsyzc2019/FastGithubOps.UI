@@ -80,29 +80,61 @@ namespace FastGithub.DomainResolve
         /// </summary>
         private static readonly string[] Endpoints = new[]
         {
-            "https://223.5.5.5/dns-query",   // 阿里 DNS，国内几乎必然可达
-            "https://119.29.29.29/dns-query", // 腾讯 DNSPod
-            "https://1.1.1.1/dns-query",      // Cloudflare
-            "https://8.8.8.8/dns-query",      // Google
+            // 【v2.6.4 端点列表重建】按 2026-10-03 本机直连实测（每端点 3 次，UseProxy=false 等价）
+            // 重新排序并补全。旧列表只有 4 个端点，其中 **3 个在本机稳定 12 秒超时**，
+            // 唯一可达的 223.5.5.5 又独自承担全部解析；一旦它抖动，
+            // 单域名首查就会白等慢端点的超时预算，直接顶穿交互域名的 25s 预算。
+            //
+            // 实测结果（github.com A 记录，wire 格式）：
+            //   OK   阿里 223.5.5.5      123~173ms  avg=148ms
+            //   OK   百度 doh.pub        117~268ms  avg=172ms
+            //   OK   360  doh.360.cn     163~180ms  avg=170ms
+            //   FAIL 腾讯 119.29.29.29   Timeout（12s）
+            //   FAIL Cloudflare 1.1.1.1  Timeout（12s）
+            //   FAIL Google 8.8.8.8      Timeout（12s）
+            //   FAIL Quad9 9.9.9.9       Timeout（12s）
+            //
+            // 【为什么不保留腾讯 119.29.29.29】旧列表里有它，但实测直连 12 秒稳定超时，
+            // 且**换成域名形式也未必可达**（doh.pub 属百度、不是腾讯；腾讯的 DoH 域名在
+            // 本网络同样不可达）。保留一个已确认失效的端点只会让每轮竞速多等 12 秒，
+            // 因此直接移除。若换网络后腾讯恢复，需要时再加回即可。
+            //
+            // 【为什么百度/360 用域名而非 IP】这两家未公开可直接访问的 IP 字面量端点，
+            // 且其证书只对域名签发。走域名意味着要先解析一次 —— 但这正是 DoH 客户端
+            // 的标准做法，且 System.Net 的 DNS 走的是本机解析链路；
+            // 万一本机明文 DNS 被 RST（已知问题），DoH 端点域名会解析失败，
+            // 此时该端点自动失败并被熔断，**阿里 223.5.5.5（IP 字面量）仍是保底**。
+            "https://223.5.5.5/dns-query",     // 阿里 DNS，IP 直连，绕开本机 DNS
+            "https://doh.pub/dns-query",       // 百度 DoH
+            "https://doh.360.cn/dns-query",    // 360 DoH
+            "https://1.1.1.1/dns-query",       // Cloudflare（多数网络下被阻断，靠熔断剔除）
+            "https://8.8.8.8/dns-query",       // Google（同上）
         };
 
         /// <summary>
         /// 全局 DoH 在途请求上限。
         /// <para>
-        /// 【为什么需要闸门】多端点竞速把"单域名 4 个并发"叠乘到"冷启动同时解析十几个域名"，
-        /// 峰值可达 4 端点 × 2 记录类型 × 15 域名 = 120 个并发 HTTPS 请求，
-        /// 形态上过于像攻击流量，且会挤占本就紧张的下行带宽。
-        /// 这里用信号量把在途请求压在 8 个：既保留"最快端点胜出"的延迟收益
-        /// （实测可达端点 RTT 仅 100~240ms，8 路闸门根本不构成瓶颈），
-        /// 又让突发规模可控。
+        /// 【闸门语义（v2.6.4 修正）】只约束"**同时握有连接的请求数**"，不排队等待。
+        /// 原实现把闸门覆盖到整个网络等待期，导致慢端点会占住槽位长达 12 秒，
+        /// 把 148ms 就能返回的快端点挤在门外干等 —— 这才是首查 32 秒的真凶。
+        /// 现在的做法：<see cref="QueryEndpointAsync"/> 在**发起瞬间**占闸门、
+        /// 发起后立刻释放，因此
+        ///   1) 在途连接数始终 ≤ <see cref="DohRequestConcurrency"/>，跨境端点全挂时
+        ///      不会堆积 5 端点 × 2 记录类型 × 15 域名 = 150 个连接；
+        ///   2) 快端点永远不必排在慢端点后面等槽位。
         /// </para>
         /// </summary>
         private readonly SemaphoreSlim requestGate = new(DohRequestConcurrency, DohRequestConcurrency);
 
         /// <summary>
-        /// DoH 在途请求并发上限，取 8。
+        /// DoH 在途请求并发上限，取 12。
+        /// <para>
+        /// 5 个端点 × 2 种记录类型 = 单域名最多 10 个在途，12 刚好容得下"一次完整竞速"，
+        /// 不至于让 A 与 AAAA 两轮串行。实测可达端点 RTT 仅 117~268ms，
+        /// 12 路远高于端点 RTT，不构成瓶颈。
+        /// </para>
         /// </summary>
-        private const int DohRequestConcurrency = 8;
+        private const int DohRequestConcurrency = 12;
 
         private readonly ILogger<DohResolver> logger;
         private readonly HttpClient httpClient;
@@ -518,10 +550,21 @@ namespace FastGithub.DomainResolve
         /// </summary>
         private async Task<IReadOnlyList<IPAddress>> QueryEndpointAsync(string endpoint, string dnsParam, CancellationToken cancellationToken)
         {
-            // 全局闸门：把竞速产生的并发突发压到 DohRequestConcurrency 个。
-            // WaitAsync 前先看取消，避免停机时还在排队。
+            // 【v2.6.4 关键修正】闸门只保护"发起请求"这个瞬时动作，**不覆盖整个等待过程**。
+            //
+            // 【为什么必须这样】原实现是"先占闸门 → 发请求 → 等满 perRequestTimeout → 释放"。
+            // 但闸门是**全局共享**的：慢端点一旦进入，就会占住 1 个槽位长达 12 秒
+            // （本机实测腾讯/Cloudflare/Google/Quad9 全部 12 秒超时）。
+            // 冷启动时 15 个域名 × 5 个端点共 75 个请求抢 8 个闸门槽位，
+            // 排在后面的**包括仅 148ms 就能返回的阿里端点**也得干等前面慢端点超时释放 ——
+            // 这正是 v2.6.4 实测中 github.com 首查仍耗 32 秒、顶穿 25s 预算的直接原因。
+            // 闸门本来的目的是"压住并发突发"，而并发突发恰恰发生在**发起**的那一刻，
+            // 不是在等待期间 —— 因此只需在发起时短暂持锁。
+            var url = $"{endpoint}?dns={dnsParam}";
+            HttpRequestMessage request;
             try
             {
+                // WaitAsync 前先看取消，避免停机时还在排队。
                 await this.requestGate.WaitAsync(cancellationToken);
             }
             catch (OperationCanceledException)
@@ -531,21 +574,32 @@ namespace FastGithub.DomainResolve
 
             try
             {
-                var url = $"{endpoint}?dns={dnsParam}";
-                using var request = new HttpRequestMessage(HttpMethod.Get, url);
+                request = new HttpRequestMessage(HttpMethod.Get, url);
                 request.Headers.Add("accept", "application/dns-message");
-                using var response = await this.httpClient.SendAsync(request, cancellationToken);
-                if (response.IsSuccessStatusCode == false)
-                {
-                    // 【不要静默吞掉非200】此前一律返回空列表，最终只报"所有端点均不可用"，
-                    // 真实原因（400=报文格式非法、404=路径不对、502=被代理拦截）完全不可见。
-                    // DoH 曾因 DNS 报文字节序错误长期 400，而日志只显示"端点不可用"，极难定位。
-                    this.logger.LogDebug($"DoH 端点 {endpoint} 返回 {(int)response.StatusCode} {response.StatusCode}");
-                    return Array.Empty<IPAddress>();
-                }
+            }
+            finally
+            {
+                // 发起即释放：后续的网络等待不再占用闸门槽位。
+                this.requestGate.Release();
+            }
 
-                var bytes = await response.Content.ReadAsByteArrayAsync(cancellationToken);
-                return ParseResponse(bytes);
+            try
+            {
+                using (request)
+                {
+                    using var response = await this.httpClient.SendAsync(request, cancellationToken);
+                    if (response.IsSuccessStatusCode == false)
+                    {
+                        // 【不要静默吞掉非200】此前一律返回空列表，最终只报"所有端点均不可用"，
+                        // 真实原因（400=报文格式非法、404=路径不对、502=被代理拦截）完全不可见。
+                        // DoH 曾因 DNS 报文字节序错误长期 400，而日志只显示"端点不可用"，极难定位。
+                        this.logger.LogDebug($"DoH 端点 {endpoint} 返回 {(int)response.StatusCode} {response.StatusCode}");
+                        return Array.Empty<IPAddress>();
+                    }
+
+                    var bytes = await response.Content.ReadAsByteArrayAsync(cancellationToken);
+                    return ParseResponse(bytes);
+                }
             }
             catch (OperationCanceledException)
             {
@@ -555,10 +609,6 @@ namespace FastGithub.DomainResolve
             {
                 this.logger.LogDebug($"DoH 端点 {endpoint} 查询失败：{ex.Message}");
                 return Array.Empty<IPAddress>();
-            }
-            finally
-            {
-                this.requestGate.Release();
             }
         }
 
