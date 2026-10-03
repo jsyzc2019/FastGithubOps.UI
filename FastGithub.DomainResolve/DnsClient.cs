@@ -29,6 +29,7 @@ namespace FastGithub.DomainResolve
         private readonly DnscryptProxy dnscryptProxy;
         private readonly FastGithubConfig fastGithubConfig;
         private readonly HostsService hostsService;
+        private readonly DohResolver dohResolver;
         private readonly ILogger<DnsClient> logger;
 
         private readonly ConcurrentDictionary<string, SemaphoreSlim> semaphoreSlims = new();
@@ -54,11 +55,13 @@ namespace FastGithub.DomainResolve
             DnscryptProxy dnscryptProxy,
             FastGithubConfig fastGithubConfig,
             HostsService hostsService,
+            DohResolver dohResolver,
             ILogger<DnsClient> logger)
         {
             this.dnscryptProxy = dnscryptProxy;
             this.fastGithubConfig = fastGithubConfig;
             this.hostsService = hostsService;
+            this.dohResolver = dohResolver;
             this.logger = logger;
         }
 
@@ -99,6 +102,19 @@ namespace FastGithub.DomainResolve
             else if (hostsOnly == true)
             {
                 yield break;
+            }
+
+            // DoH 解析：明文 53 端口 DNS 在部分网络下会被 RST 注入而彻底失效，
+            // 这是此前「拿不到任何新 IP、只剩过期持久化 IP」的根因。
+            // DoH 走 443 且使用 IP 字面量直连，规避该故障，作为候选 IP 的主要补充来源。
+            // 仅正常解析路径使用；手动「仅 hosts 源刷新」语义上属于纯 hosts，跳过 DoH。
+            var dohAddresses = await this.dohResolver.ResolveAsync(endPoint.Host, cancellationToken);
+            foreach (var address in dohAddresses)
+            {
+                if (hashSet.Add(address) == true)
+                {
+                    yield return address;
+                }
             }
 
             await foreach (var dns in this.GetDnsServersAsync(cancellationToken))
