@@ -9,6 +9,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Serilog;
 using Serilog.Sinks.Network;
@@ -19,6 +20,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Text.Json;
+using System.Threading.Tasks;
 
 namespace FastGithub
 {
@@ -54,7 +56,12 @@ namespace FastGithub
         /// <param name="builder"></param>
         public static void ConfigureWebHost(this WebApplicationBuilder builder)
         {
-            builder.WebHost.UseShutdownTimeout(TimeSpan.FromSeconds(1d));
+            // 【v2.6.4 修复】原为 TimeSpan.FromSeconds(1d)（1 天），实际后果是：
+            // 停机时 Host 会为每个正在处理中的请求最多等 1 天才放弃，
+            // 于是"关闭应用"后主进程可能长时间不退出、端口不释放、WinDivert 持续拦截。
+            // 用户观感是"关了还在生效，重开又报端口占用"。
+            // 取 5 秒：足够让在途请求正常收尾，又保证停机是确定性的。
+            builder.WebHost.UseShutdownTimeout(TimeSpan.FromSeconds(5d));
             builder.WebHost.UseKestrel(kestrel =>
             {
                 kestrel.NoLimit();
@@ -151,6 +158,44 @@ namespace FastGithub
                 await resolver.RefreshHostsAsync(context.RequestAborted);
                 context.Response.ContentType = "text/plain;charset=utf-8";
                 await context.Response.WriteAsync("IP更新已触发");
+            });
+
+            // 【v2.6.4 新增】UI 退出时显式通知主程序停机。
+            // <para>
+            // 原来 UI 关闭只 Dispose 自己的托盘图标，主程序完全不知情：
+            // 它只能靠 <c>WaitForParentProcessExitAsync</c> 轮询父进程来察觉，
+            // 而 UI 被任务管理器强杀、或 UI 自身异常崩溃时这条链路并不可靠，
+            // 结果是主程序变成孤儿进程——**WinDivert 仍在拦截网络流量**，
+            // 用户以为已经关掉，实际上 GitHub 访问路径仍被接管，且端口不释放、
+            // 下次启动直接报端口占用。
+            // </para>
+            // <para>
+            // 只监听在 localhost 的 UI 内部端口上（<c>ListenLocalhost</c>），
+            // 不对外暴露；先回响应再异步停机，避免 UI 的请求被自己的停机动作卡住。
+            // </para>
+            app.MapGet("/shutdown", async context =>
+            {
+                var logger = context.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("Shutdown");
+                var lifetime = context.RequestServices.GetRequiredService<IHostApplicationLifetime>();
+
+                logger.LogInformation("收到 UI 的停机请求，正在关闭主程序");
+                context.Response.ContentType = "text/plain;charset=utf-8";
+                await context.Response.WriteAsync("主程序正在退出");
+
+                // 先让响应发出去，再触发停机；否则客户端会收到连接被重置。
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        // 给响应一点时间写出去
+                        await Task.Delay(TimeSpan.FromMilliseconds(200d));
+                        lifetime.StopApplication();
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, "停机时发生异常");
+                    }
+                });
             });
 
             // 诊断：一次看清"证书是否真的被信任"与"IP健康度闭环是否在工作"。

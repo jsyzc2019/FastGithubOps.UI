@@ -86,6 +86,24 @@ namespace FastGithub.DomainResolve
             "https://8.8.8.8/dns-query",      // Google
         };
 
+        /// <summary>
+        /// 全局 DoH 在途请求上限。
+        /// <para>
+        /// 【为什么需要闸门】多端点竞速把"单域名 4 个并发"叠乘到"冷启动同时解析十几个域名"，
+        /// 峰值可达 4 端点 × 2 记录类型 × 15 域名 = 120 个并发 HTTPS 请求，
+        /// 形态上过于像攻击流量，且会挤占本就紧张的下行带宽。
+        /// 这里用信号量把在途请求压在 8 个：既保留"最快端点胜出"的延迟收益
+        /// （实测可达端点 RTT 仅 100~240ms，8 路闸门根本不构成瓶颈），
+        /// 又让突发规模可控。
+        /// </para>
+        /// </summary>
+        private readonly SemaphoreSlim requestGate = new(DohRequestConcurrency, DohRequestConcurrency);
+
+        /// <summary>
+        /// DoH 在途请求并发上限，取 8。
+        /// </summary>
+        private const int DohRequestConcurrency = 8;
+
         private readonly ILogger<DohResolver> logger;
         private readonly HttpClient httpClient;
         private readonly ConcurrentDictionary<string, (DateTime Expires, IReadOnlyList<IPAddress> Addresses)> positiveCache = new();
@@ -258,14 +276,7 @@ namespace FastGithub.DomainResolve
         }
 
         /// <summary>
-        /// 对单个记录类型发起 wire 格式 DoH 查询。
-        /// <para>
-        /// 端点分两组：**国内优先**（阿里 223.5.5.5 / 腾讯 119.29.29.29，本机网络几乎必然可达）；
-        /// **国际兜底**（Cloudflare / Google，部分网络下被阻断）。先试国内，国内任一端点成功即停止，
-        /// 不再打扰国际；只有国内全失败时再试国际。所有 DoH 服务器对同域返回相同答案，
-        /// "命中即止"既快又稳，也避免被阻断的国际端点拖累整体耗时。
-        /// 每组内每个端点还有 1 次重试（见 QueryEndpointWithRetryAsync），应对瞬时超时。
-        /// </para>
+        /// 解析域名的 A / AAAA 记录
         /// </summary>
         private async Task<IReadOnlyList<IPAddress>> ResolveWireAsync(string host, ushort type, CancellationToken cancellationToken)
         {
@@ -278,41 +289,129 @@ namespace FastGithub.DomainResolve
 
             var dnsParam = ToBase64Url(requestBytes);
 
-            var domestic = Endpoints.Where(e => e.Contains("223.5.5.5") || e.Contains("119.29.29.29")).ToArray();
-            var international = Endpoints.Except(domestic).ToArray();
-
+            // 【v2.6.4 关键修复】由"串行遍历 + 命中即止"改为**多端点并发竞速**。
+            //
+            // 【为什么必须改】旧实现按"国内优先(阿里/腾讯) -> 国际兜底(Cloudflare/Google)"
+            // 串行遍历。实测本机 223.5.5.5 约 100~240ms 可达，但**首次启动时它常常并不快**
+            // （TLS 握手要现建、端点侧可能正在排队），于是一个域名要等满
+            // perRequestTimeout(12s) × 重试(2) 才轮到下一个端点。
+            // 冷启动时三个端点各等一轮 = 最坏 12×2 + 12×2 + 12×2 = 72s，
+            // 实际日志观测到 github.com 从发起（22:01:51）到解析成功（22:02:21）耗时 **30 秒**，
+            // 而交互域名的整体请求预算只有 25s —— 直接 504。
+            //
+            // 【为什么并发是对的】所有标准 DoH 服务器对**同一域名、同一记录类型**
+            // 返回的是同一份权威答案（都来自权威 NS），只是延迟不同。
+            // 因此"最快可用者"与"逐个尝试"得到的答案完全一致，
+            // 而耗时从"最慢端点的累加"降为"最快端点的 RTT"。
+            // 实测本机可达端点的 RTT 是 100~240ms —— 并发后单域名首查应落在这个量级。
+            //
+            // 【流量代价可控】同一时刻最多 4 个并发请求，且：
+            //   1) 熔断机制继续生效：连续失败的端点会被跳过，跨境死端点很快不再参与；
+            //   2) 竞速是"先回者胜"，其余请求在首个成功后立即被取消（见 winnerCts），
+            //      正常情况下不会打满 4 个请求。
+            // 相比"几十个域名串行各等 12~24s"，总流量与耗时都是净减少。
             var merged = new HashSet<IPAddress>();
-            await QueryEndpointsAsync(domestic, dnsParam, merged, cancellationToken);
-            if (merged.Count == 0)
+            var available = new List<string>();
+            foreach (var endpoint in Endpoints)
             {
-                await QueryEndpointsAsync(international, dnsParam, merged, cancellationToken);
+                if (IsEndpointBlocked(endpoint) == false)
+                {
+                    available.Add(endpoint);
+                }
             }
+
+            if (available.Count == 0)
+            {
+                // 全部端点都在熔断冷却期：这是"网络环境已彻底不可用"，
+                // 此时再发起请求也只会白等 perRequestTimeout，直接返回空。
+                this.logger.LogWarning("所有 DoH 端点均处于熔断冷却期，本轮不发起查询");
+                return merged.ToArray();
+            }
+
+            // winnerCts 在首个端点成功返回后立即取消，其余在途请求随之作废。
+            // 注意它与 cancellationToken 链接：外部停机时它同样会被取消。
+            using var winnerCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var tasks = available
+                .Select(endpoint => QueryEndpointRaceAsync(endpoint, dnsParam, winnerCts.Token))
+                .ToArray();
+
+            // 逐个收割：任何一个端点带回结果即认定成功并取消其余。
+            // 用 WhenAny 而非 WhenAll，是为了把耗时从"最慢端点"降到"最快端点"。
+            var pending = new HashSet<Task<IReadOnlyList<IPAddress>>>(tasks);
+            var anySucceeded = false;
+            while (pending.Count > 0)
+            {
+                var finished = await Task.WhenAny(pending);
+                pending.Remove(finished);
+
+                var addresses = await finished;
+                foreach (var address in addresses)
+                {
+                    merged.Add(address);
+                }
+
+                if (merged.Count > 0)
+                {
+                    anySucceeded = true;
+                    break;
+                }
+            }
+
+            if (anySucceeded)
+            {
+                // 已有可用答案：取消余下端点，不再打扰它们。
+                // 未被 await 的任务异常必须被观察，否则会成为 unobserved task exception。
+                foreach (var task in pending)
+                {
+                    _ = task.ContinueWith(
+                        t => _ = t.Exception,
+                        TaskContinuationOptions.OnlyOnFaulted);
+                }
+                winnerCts.Cancel();
+            }
+            else
+            {
+                // 全部端点都失败：此时所有任务都已结束，熔断计数已在各自任务内上报。
+                foreach (var task in tasks)
+                {
+                    _ = task.Exception;
+                }
+            }
+
+            if (anySucceeded == false && cancellationToken.IsCancellationRequested == false)
+            {
+                this.logger.LogDebug($"{host} type={type}：{available.Count} 个 DoH 端点全部失败");
+            }
+
             return merged.ToArray();
         }
 
         /// <summary>
-        /// 依次查询一组 DoH 端点，首个成功者即停止（命中即止），结果并入 sink。
+        /// 竞速模式下的单端点查询：内部自行完成"重试 + 熔断计数上报"，
+        /// 失败一律返回空列表而**不抛异常**，这样 <see cref="Task.WhenAny(Task[])"/>
+        /// 可以直接收割任意一个完成任务而无需 try/catch。
         /// </summary>
-        private async Task QueryEndpointsAsync(string[] endpoints, string dnsParam, HashSet<IPAddress> sink, CancellationToken cancellationToken)
+        /// <param name="endpoint">DoH 端点</param>
+        /// <param name="dnsParam">base64url 编码的 DNS 报文字节</param>
+        /// <param name="raceToken">竞速令牌；被取消表示已有其它端点胜出或整体停机</param>
+        /// <returns>该端点解析到的地址；不可用或失败时为空列表</returns>
+        private async Task<IReadOnlyList<IPAddress>> QueryEndpointRaceAsync(string endpoint, string dnsParam, CancellationToken raceToken)
         {
-            foreach (var endpoint in endpoints)
+            try
             {
-                // 【熔断跳过】仍在冷却期内的端点直接不发起请求。
-                // 这既省掉每域名每次解析各 12~24s 的白等，也让"命中即止"在有死端点时不再退化成串行空等。
-                if (IsEndpointBlocked(endpoint))
-                {
-                    continue;
-                }
-
-                var addresses = await QueryEndpointWithRetryAsync(endpoint, dnsParam, cancellationToken);
-                foreach (var address in addresses)
-                {
-                    sink.Add(address);
-                }
-                if (sink.Count > 0)
-                {
-                    break;
-                }
+                var addresses = await this.QueryEndpointWithRetryAsync(endpoint, dnsParam, raceToken);
+                return addresses;
+            }
+            catch (OperationCanceledException)
+            {
+                // 竞速令牌被取消：说明已有端点胜出，或整体停机。
+                // 两种情况都不该算该端点失败，否则一次正常的竞速胜出会把所有端点熔断。
+                return Array.Empty<IPAddress>();
+            }
+            catch (Exception ex)
+            {
+                this.logger.LogDebug($"DoH 端点 {endpoint} 竞速查询异常：{ex.Message}");
+                return Array.Empty<IPAddress>();
             }
         }
 
@@ -398,7 +497,15 @@ namespace FastGithub.DomainResolve
 
                 if (attempt < maxTries - 1)
                 {
-                    await Task.Delay(TimeSpan.FromMilliseconds(400d), cancellationToken);
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromMilliseconds(400d), cancellationToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // 竞速模式下另一端点已胜出：退避等待被取消是正常路径，不计失败。
+                        return Array.Empty<IPAddress>();
+                    }
                 }
             }
 
@@ -411,6 +518,17 @@ namespace FastGithub.DomainResolve
         /// </summary>
         private async Task<IReadOnlyList<IPAddress>> QueryEndpointAsync(string endpoint, string dnsParam, CancellationToken cancellationToken)
         {
+            // 全局闸门：把竞速产生的并发突发压到 DohRequestConcurrency 个。
+            // WaitAsync 前先看取消，避免停机时还在排队。
+            try
+            {
+                await this.requestGate.WaitAsync(cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                return Array.Empty<IPAddress>();
+            }
+
             try
             {
                 var url = $"{endpoint}?dns={dnsParam}";
@@ -437,6 +555,10 @@ namespace FastGithub.DomainResolve
             {
                 this.logger.LogDebug($"DoH 端点 {endpoint} 查询失败：{ex.Message}");
                 return Array.Empty<IPAddress>();
+            }
+            finally
+            {
+                this.requestGate.Release();
             }
         }
 

@@ -154,17 +154,48 @@ namespace FastGithub
                 return;
             }
 
+            var exited = false;
             try
             {
-                Process.GetProcessById(parentId).WaitForExit();
+                using var process = Process.GetProcessById(parentId);
+
+                // 【v2.6.4 修复】原实现用 WaitForExit() 无限阻塞，且没有任何日志。
+                // 改为轮询：既能感知退出，也能在日志里留下"父进程已退出"的明确记录，
+                // 让"托盘关掉后主程序还在拦截"这类问题有据可查。
+                while (cancellationToken.IsCancellationRequested == false)
+                {
+                    if (process.HasExited)
+                    {
+                        exited = true;
+                        break;
+                    }
+
+                    await Task.Delay(TimeSpan.FromMilliseconds(500d), cancellationToken);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // 整体停机中，属正常路径
+                return;
+            }
+            catch (ArgumentException)
+            {
+                // 进程已不存在（GetProcessById 抛"找不到进程"），等同于已退出。
+                // 这是最常见的情形：UI 被任务管理器强杀后进程立即消失。
+                exited = true;
             }
             catch (Exception ex)
             {
-                this.logger.LogError(ex, $"获取进程{parentId}异常");
+                // 【v2.6.4 修复】原为 LogError，但"查父进程失败"多是权限或进程已消失等
+                // 正常情况，记 Error 会让用户误以为程序出了故障。
+                // 降为 Warning：仍需可见，但不制造恐慌。
+                this.logger.LogWarning(ex, $"获取进程{parentId}异常，按已退出处理");
+                exited = true;
             }
-            finally
+
+            if (exited)
             {
-                this.logger.LogInformation($"正在主动关闭，因为父进程已退出");
+                this.logger.LogInformation($"检测到父进程 {parentId} 已退出，正在主动关闭主程序");
                 await this.host.StopAsync(cancellationToken);
             }
         }
