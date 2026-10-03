@@ -27,14 +27,22 @@ namespace FastGithub.DomainResolve
     sealed class DohResolver
     {
         /// <summary>
-        /// 正查询缓存时长：成功的 DoH 结果会被复用，避免后台每秒一次的测速把 DoH 打爆
+        /// 正查询缓存时长：成功的 DoH 结果会被复用，避免后台每秒一次的测速把 DoH 打爆。
+        /// <para>
+        /// 取 10 分钟而非更短：GitHub 边缘 IP 本身很稳定，缓存过短会让候选 IP 频繁漂移
+        /// （新 IP 不断插到候选池前面、重排），同一域名反复换 IP 反而更易触发对端风控、
+        /// 降低"粘性"。需要新 IP 时，健康度失败会触发 RefreshAsync 主动清缓存重解析，
+        /// 不依赖这里的短 TTL，因此 10 分钟足够安全。
+        /// </para>
         /// </summary>
-        private static readonly TimeSpan positiveCacheTtl = TimeSpan.FromMinutes(2d);
+        private static readonly TimeSpan positiveCacheTtl = TimeSpan.FromMinutes(10d);
 
         /// <summary>
-        /// 单次 DoH 请求的整体预算
+        /// 单次 DoH 请求的整体预算。本机网络到 DoH 端点的 RTT 可能达数秒
+        /// （与到 GitHub 的 RTT 同源），8s 曾在拥塞时把"慢但可用"的国内端点判死，
+        /// 导致所有端点均不可用。放宽到 12s 留足余量；端点级还有重试兜底。
         /// </summary>
-        private static readonly TimeSpan perRequestTimeout = TimeSpan.FromSeconds(8d);
+        private static readonly TimeSpan perRequestTimeout = TimeSpan.FromSeconds(12d);
 
         /// <summary>
         /// 使用 IP 字面量（而非域名）作为 DoH 端点，使客户端无需先解析域名，
@@ -69,6 +77,19 @@ namespace FastGithub.DomainResolve
             {
                 Timeout = perRequestTimeout
             };
+        }
+
+        /// <summary>
+        /// 使正查询缓存立即失效。
+        /// <para>
+        /// 由「IP 被阻断后的恢复」路径调用：正缓存有 10 分钟，若不失效，
+        /// 失败后触发的重解析会原样拿回同一批刚被阻断的 IP，恢复速度永远快不起来。
+        /// 只在明确的故障恢复时调用，正常轮询期间不动缓存（避免 IP 频繁漂移）。
+        /// </para>
+        /// </summary>
+        public void InvalidateCache()
+        {
+            this.positiveCache.Clear();
         }
 
         /// <summary>
@@ -114,25 +135,78 @@ namespace FastGithub.DomainResolve
         }
 
         /// <summary>
-        /// 对单个记录类型发起 wire 格式 DoH 查询，并在所有端点间取并集
+        /// 对单个记录类型发起 wire 格式 DoH 查询。
+        /// <para>
+        /// 端点分两组：**国内优先**（阿里 223.5.5.5 / 腾讯 119.29.29.29，本机网络几乎必然可达）；
+        /// **国际兜底**（Cloudflare / Google，部分网络下被阻断）。先试国内，国内任一端点成功即停止，
+        /// 不再打扰国际；只有国内全失败时再试国际。所有 DoH 服务器对同域返回相同答案，
+        /// "命中即止"既快又稳，也避免被阻断的国际端点拖累整体耗时。
+        /// 每组内每个端点还有 1 次重试（见 QueryEndpointWithRetryAsync），应对瞬时超时。
+        /// </para>
         /// </summary>
         private async Task<IReadOnlyList<IPAddress>> ResolveWireAsync(string host, ushort type, CancellationToken cancellationToken)
         {
             var requestBytes = BuildRequest(host, type);
+            if (requestBytes.Length == 0)
+            {
+                // 域名格式非法（如连续点、标签超长），不发无意义的请求
+                return Array.Empty<IPAddress>();
+            }
+
             var dnsParam = ToBase64Url(requestBytes);
 
-            var tasks = Endpoints.Select(endpoint => QueryEndpointAsync(endpoint, dnsParam, cancellationToken)).ToArray();
-            var results = await Task.WhenAll(tasks);
+            var domestic = Endpoints.Where(e => e.Contains("223.5.5.5") || e.Contains("119.29.29.29")).ToArray();
+            var international = Endpoints.Except(domestic).ToArray();
 
             var merged = new HashSet<IPAddress>();
-            foreach (var addresses in results)
+            await QueryEndpointsAsync(domestic, dnsParam, merged, cancellationToken);
+            if (merged.Count == 0)
             {
-                foreach (var address in addresses)
-                {
-                    merged.Add(address);
-                }
+                await QueryEndpointsAsync(international, dnsParam, merged, cancellationToken);
             }
             return merged.ToArray();
+        }
+
+        /// <summary>
+        /// 依次查询一组 DoH 端点，首个成功者即停止（命中即止），结果并入 sink。
+        /// </summary>
+        private async Task QueryEndpointsAsync(string[] endpoints, string dnsParam, HashSet<IPAddress> sink, CancellationToken cancellationToken)
+        {
+            foreach (var endpoint in endpoints)
+            {
+                var addresses = await QueryEndpointWithRetryAsync(endpoint, dnsParam, cancellationToken);
+                foreach (var address in addresses)
+                {
+                    sink.Add(address);
+                }
+                if (sink.Count > 0)
+                {
+                    break;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 向单个 DoH 端点发送 wire 格式查询（带 1 次重试），解析响应。
+        /// <para>单次 DoH 请求可能因网络瞬时拥塞超时；重试一次即可覆盖大多数瞬时抖动，
+        /// 又不至于把整体解析拖得太久（重试预算仍受 httpClient.Timeout 约束）。</para>
+        /// </summary>
+        private async Task<IReadOnlyList<IPAddress>> QueryEndpointWithRetryAsync(string endpoint, string dnsParam, CancellationToken cancellationToken)
+        {
+            const int maxTries = 2;
+            for (var attempt = 0; attempt < maxTries; attempt++)
+            {
+                var result = await QueryEndpointAsync(endpoint, dnsParam, cancellationToken);
+                if (result.Count > 0)
+                {
+                    return result;
+                }
+                if (attempt < maxTries - 1)
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(400d), cancellationToken);
+                }
+            }
+            return Array.Empty<IPAddress>();
         }
 
         /// <summary>
@@ -148,6 +222,10 @@ namespace FastGithub.DomainResolve
                 using var response = await this.httpClient.SendAsync(request, cancellationToken);
                 if (response.IsSuccessStatusCode == false)
                 {
+                    // 【不要静默吞掉非200】此前一律返回空列表，最终只报"所有端点均不可用"，
+                    // 真实原因（400=报文格式非法、404=路径不对、502=被代理拦截）完全不可见。
+                    // DoH 曾因 DNS 报文字节序错误长期 400，而日志只显示"端点不可用"，极难定位。
+                    this.logger.LogDebug($"DoH 端点 {endpoint} 返回 {(int)response.StatusCode} {response.StatusCode}");
                     return Array.Empty<IPAddress>();
                 }
 
@@ -167,33 +245,55 @@ namespace FastGithub.DomainResolve
 
         /// <summary>
         /// 构造一个最简 DNS 查询报文（RD=1，单问题）
+        /// <para>
+        /// 【关键】所有 16 位字段必须按**大端序**（网络字节序）写入。
+        /// 原实现用 <c>BinaryWriter.Write(ushort)</c>，而它写的是**小端序**：
+        /// FLAGS 0x0100 被写成 00 00 01 00、QTYPE/QCLASS 被写成 01 00 00 01，
+        /// 整个头部字节序错位，DoH 服务端收到格式非法的报文后一律返回 **HTTP 400**。
+        /// 表现是"DoH 解析失败：所有端点均不可用"、日志里 0 次成功，
+        /// 而实际上网络与端点完全正常（实测阿里 DoH 直连 462ms 正常返回）——
+        /// 于此同时明文 DNS 又被 RST，整个解析层两条路同时失效。
+        /// </para>
         /// </summary>
         private static byte[] BuildRequest(string host, ushort type)
         {
             using var ms = new System.IO.MemoryStream();
             using var writer = new System.IO.BinaryWriter(ms);
 
-            // Header: ID(2) + Flags(2)=0x0100(RD) + QDCOUNT(2)=1 + 其余为0
-            writer.Write((ushort)0x0000);
-            writer.Write((ushort)0x0100);
-            writer.Write((ushort)0x0001);
-            writer.Write((ushort)0x0000);
-            writer.Write((ushort)0x0000);
-            writer.Write((ushort)0x0000);
+            // 显式大端写入，避免 BinaryWriter 的小端序
+            void WriteUInt16(ushort value)
+            {
+                writer.Write((byte)(value >> 8));
+                writer.Write((byte)(value & 0xFF));
+            }
+
+            // Header: ID(2) + Flags(2)=0x0100(RD) + QDCOUNT(2)=1 + ANCOUNT/NSCOUNT/ARCOUNT
+            WriteUInt16(0x0000);// ID
+            WriteUInt16(0x0100);      // Flags: RD=1（递归查询）
+            WriteUInt16(0x0001);      // QDCOUNT=1
+            WriteUInt16(0x0000);      // ANCOUNT=0
+            WriteUInt16(0x0000);      // NSCOUNT=0
+            WriteUInt16(0x0000);      // ARCOUNT=0
 
             // QNAME: 长度前缀标签序列，以 0 结尾
             foreach (var label in host.Split('.'))
             {
                 var labelBytes = Encoding.ASCII.GetBytes(label);
+                if (labelBytes.Length == 0 || labelBytes.Length > 63)
+                {
+                    // 标签长度非法（空标签出现在连续点或首尾点），返回空报文由调用方判失败
+                    return Array.Empty<byte>();
+                }
                 writer.Write((byte)labelBytes.Length);
                 writer.Write(labelBytes);
             }
             writer.Write((byte)0x00);
 
             // QTYPE + QCLASS(IN=1)
-            writer.Write(type);
-            writer.Write((ushort)0x0001);
+            WriteUInt16(type);
+            WriteUInt16(0x0001);
 
+            writer.Flush();
             return ms.ToArray();
         }
 

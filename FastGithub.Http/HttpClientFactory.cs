@@ -1,5 +1,6 @@
 ﻿using FastGithub.Configuration;
 using FastGithub.DomainResolve;
+using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Concurrent;
 
@@ -11,6 +12,7 @@ namespace FastGithub.Http
     sealed class HttpClientFactory : IHttpClientFactory
     {
         private readonly IDomainResolver domainResolver;
+        private readonly ILogger<HttpClientHandler> handlerLogger;
 
         /// <summary>
         /// 首次生命周期
@@ -37,9 +39,10 @@ namespace FastGithub.Http
         /// HttpClient工厂
         /// </summary>
         /// <param name="domainResolver"></param>
-        public HttpClientFactory(IDomainResolver domainResolver)
+        public HttpClientFactory(IDomainResolver domainResolver, ILoggerFactory loggerFactory)
         {
             this.domainResolver = domainResolver;
+            this.handlerLogger = loggerFactory.CreateLogger<HttpClientHandler>();
         }
 
         /// <summary>
@@ -68,7 +71,7 @@ namespace FastGithub.Http
         /// <returns></returns>
         private LifetimeHttpHandler CreateLifetimeHttpHandler(LifeTimeKey lifeTimeKey, TimeSpan lifeTime)
         {
-            return new LifetimeHttpHandler(this.domainResolver, lifeTimeKey, lifeTime, this.OnLifetimeHttpHandlerDeactivate);
+            return new LifetimeHttpHandler(this.domainResolver, lifeTimeKey, lifeTime, this.OnLifetimeHttpHandlerDeactivate, this.handlerLogger);
         }
 
         /// <summary>

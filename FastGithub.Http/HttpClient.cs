@@ -22,8 +22,8 @@ namespace FastGithub.Http
         /// </summary>
         /// <param name="domainConfig"></param>
         /// <param name="domainResolver"></param>
-        public HttpClient(DomainConfig domainConfig, IDomainResolver domainResolver)
-            : this(new HttpClientHandler(domainConfig, domainResolver), disposeHandler: true)
+        public HttpClient(DomainConfig domainConfig, IDomainResolver domainResolver, Microsoft.Extensions.Logging.ILogger<HttpClientHandler>? logger = null)
+            : this(new HttpClientHandler(domainConfig, domainResolver, logger), disposeHandler: true)
         {
         }
 

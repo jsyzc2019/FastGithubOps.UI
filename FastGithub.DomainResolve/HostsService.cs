@@ -29,6 +29,13 @@ namespace FastGithub.DomainResolve
         private int consecutiveFailures;
 
         /// <summary>
+        /// 累计被丢弃的无效 IP 数量（环回/内网/污染段）。
+        /// 源里出现这类地址说明源本身已被污染或格式异常，需明确告警而非静默丢弃——
+        /// 否则表现只是"某些域名不通"，几乎无法定位。
+        /// </summary>
+        private int invalidIpCount;
+
+        /// <summary>
         /// 在线hosts源解析服务
         /// </summary>
         /// <param name="options"></param>
@@ -63,7 +70,8 @@ namespace FastGithub.DomainResolve
             try
             {
                 var content = await this.httpClient.GetStringAsync(hostsUrl, cancellationToken);
-                var map = Parse(content);
+                var map = Parse(content, out var invalidCount);
+                this.invalidIpCount = invalidCount;
 
                 this.mapping.Clear();
                 foreach (var item in map)
@@ -73,6 +81,14 @@ namespace FastGithub.DomainResolve
 
                 this.consecutiveFailures = 0;
                 this.logger.LogInformation($"已更新在线hosts解析，共{this.mapping.Count}个域名");
+
+                if (this.invalidIpCount > 0)
+                {
+                    this.logger.LogWarning(
+                        $"在线hosts源中有 {this.invalidIpCount} 个无效IP（127.0.0.1 等环回地址、" +
+                        "私有网段或已知污染地址）已被丢弃。这类地址若被当作候选会把请求导向本机或错误目标。" +
+                        "如持续出现，说明该源已被污染，建议更换（FastGithub:HostsUrl）。");
+                }
             }
             catch (Exception ex)
             {
@@ -115,10 +131,12 @@ namespace FastGithub.DomainResolve
         /// 解析hosts文本内容
         /// </summary>
         /// <param name="content">hosts文本</param>
+        /// <param name="invalidCount">被丢弃的无效IP 数量（环回/内网/污染段）</param>
         /// <returns>域名->IP映射</returns>
-        private static Dictionary<string, IReadOnlyList<IPAddress>> Parse(string content)
+        private static Dictionary<string, IReadOnlyList<IPAddress>> Parse(string content, out int invalidCount)
         {
             var map = new Dictionary<string, List<IPAddress>>();
+            invalidCount = 0;
             foreach (var line in content.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
             {
                 var trimmed = line.Trim();
@@ -133,14 +151,30 @@ namespace FastGithub.DomainResolve
                     continue;
                 }
 
+                // 【关键】过滤环回/内网/保留段/已知污染地址。
+                // 原实现只做 TryParse，导致源里出现的 127.0.0.1、192.168.x.x、
+                // 或污染地址会被原样当作候选 IP，且hosts 源在 DnsClient 中优先级最高
+                // （排在 DoH 与 DNS 之前），于是它会直接占据首选位置——
+                // 实际日志已出现 "avatars.githubusercontent.com->127.0.0.1"，
+                // 请求被导向本机回环，表现为"域名完全不通"且原因极难定位。
+                if (IpAddressFilter.IsInvalid(ip))
+                {
+                    invalidCount++;
+                    continue;
+                }
+
                 var host = parts[1].Trim().ToLowerInvariant();
                 if (map.TryGetValue(host, out var list) == false)
                 {
                     list = new List<IPAddress>();
                     map[host] = list;
                 }
-                list.Add(ip);
+                if (list.Contains(ip) == false)
+                {
+                    list.Add(ip);
+                }
             }
+
             return map.ToDictionary(item => item.Key, item => (IReadOnlyList<IPAddress>)item.Value);
         }
     }

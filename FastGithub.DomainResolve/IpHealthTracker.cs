@@ -54,9 +54,11 @@ namespace FastGithub.DomainResolve
         /// <summary>
         /// 连续失败达到该次数即拉黑。
         /// <para>
-        /// dev-sidecar 取 1，但那是「宁可立刻换IP」的激进策略；
-        /// 本项目默认放宽到 2，避免单次网络抖动（WiFi 瞬断、网关重启）
-        /// 直接把一个域名的全部候选IP一次性拉黑。
+        /// 取 2（此前为 3）：本参数与<a cref="BlacklistDuration"/>、以及 DomainResolver 的
+        /// REFRESH_COOLDOWN 是**串联**关系，一个坏 IP 从"首次失败"到"被彻底让位"的总时延
+        /// 约等于 KeepErrorThreshold × 单次失败耗时 + BlacklistDuration + REFRESH_COOLDOWN。
+        /// 原值 3+ 5min+ 30s 意味着被阻断后要等数分钟才换IP——这正是"恢复速度不够快"的直接原因。
+        /// 降到 2 让坏 IP 更快让位，同时仍高于 dev-sidecar 的 1，保留一次容错避免网络瞬断即误杀。
         /// </para>
         /// </summary>
         public int KeepErrorThreshold { get; set; } = 2;
@@ -67,9 +69,21 @@ namespace FastGithub.DomainResolve
         public double MinSuccessRate { get; set; } = 0.4d;
 
         /// <summary>
-        /// 拉黑时长
+        /// 拉黑时长。
+        /// <para>
+        /// 取 30 秒（原 5 分钟，v2.5.4 曾从 2 分钟上调到 5 分钟以抑制抖动）。
+        /// 【为什么又调回来】用户实测反馈"被阻断后恢复速度不够快"，而拉黑时长是这条链路上
+        /// 最长的一环：拉黑期内该IP 既不参与排序、又会在探测时被跳过，
+        /// 若这段时间内没有新IP 可用，该域名就只有一个被拉黑的候选，等于事实不可用。
+        /// <para>
+        /// 抖动其实是上一次上调想解决的问题，但它的正确解法是"IP 稳定"（DoH 缓存 10 分钟 +
+        /// 粘性单次握手），而不是"把坏 IP 关很久"——关很久正好牺牲了恢复速度。
+        /// 这里取 30 秒：足以让坏 IP 让位并被新IP 顶替，又不会让一个仅短暂抖动的 IP 被长时间丢弃。
+        /// 真正的兜底是"全部拉黑时强制回退重试"（见 HttpClientHandler.ConnectCallback），
+        /// 因此即便误拉黑也不会导致域名不可用。
+        /// </para>
         /// </summary>
-        public TimeSpan BlacklistDuration { get; set; } = TimeSpan.FromMinutes(2d);
+        public TimeSpan BlacklistDuration { get; set; } = TimeSpan.FromSeconds(30d);
 
         /// <summary>
         /// 获取key

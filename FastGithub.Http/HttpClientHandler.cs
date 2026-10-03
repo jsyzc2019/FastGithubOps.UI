@@ -1,5 +1,6 @@
 ﻿using FastGithub.Configuration;
 using FastGithub.DomainResolve;
+using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -19,27 +20,38 @@ namespace FastGithub.Http
     /// <summary>
     /// HttpClientHandler
     /// </summary> 
-    class HttpClientHandler : DelegatingHandler
+    public class HttpClientHandler : DelegatingHandler
     {
         private readonly DomainConfig domainConfig;
         private readonly IDomainResolver domainResolver;
-        // 单IP 建连预算。原值 5s 是在"串行逐个尝试"假设下定的：那时 3 个坏 IP 要干等 15 秒，
-        // 不敢给太长。现已改为并发赛马（取第一个胜出者、余者立即取消），最坏耗时从 N×超时 降到 1×超时，
-        // 放开到 10s 不会让用户卡死，却能覆盖跨境链路常见的高 RTT。
-        // 实测本机到 github.com:443 的 RTT 常达 5.3s（一条 502 响应就用了 5287ms），
-        // 5s 会把"慢但可用"的IP在 TCP 握手里直接判死。预算只覆盖 TCP 建连，
-        // TLS 握手另有独立预算（tlsHandshakeTimeout），二者压在同一数字上才会误杀优质IP。
-        private readonly TimeSpan connectTimeout = TimeSpan.FromSeconds(10d);
+        private readonly ILogger<HttpClientHandler>? logger;
 
-        // TLS 握手单独给一份更宽的预算，避免把"握手慢但服务正常"的IP判为坏IP
-        private readonly TimeSpan tlsHandshakeTimeout = TimeSpan.FromSeconds(10d);
+        // 默认单IP建连预算（TCP+TLS）。跨境链路 RTT 差异极大：github.com 交互请求常在 5s 左右，
+        // 而 raw.githubusercontent.com / codeload.github.com 这类承载大文件、git 对象的域名
+        // 单条 502 就曾耗时 12s+。默认值仅作兜底，具体域名可用 DomainConfig.ConnectTimeout 覆盖
+        // （见 appsettings.github.json）：githubusercontent/codeload 等设为 25s。
+        private readonly TimeSpan defaultConnectTimeout = TimeSpan.FromSeconds(10d);
 
-        // 并发赛马中后续候选的错开间隔（RFC 8305 Happy Eyeballs）
-        private static readonly TimeSpan RACE_STAGGER = TimeSpan.FromMilliseconds(250d);
+        /// <summary>
+        /// 当前域名的建连（TCP+TLS）预算：优先取按域名配置的 ConnectTimeout，否则用默认值。
+        /// TLS 握手预算与之联动——若该域名被配置了更长的建连预算，握手自然也该放宽，
+        /// 否则"握手慢但服务正常"的IP会被误杀。
+        /// </summary>
+        private TimeSpan ConnectBudget => this.domainConfig.ConnectTimeout ?? this.defaultConnectTimeout;
 
-        // 并发赛马的候选上限。候选来自 hosts源 + DNS 补充，数量可能不少；
-        // 全部并发会同时打出大量握手，而排序靠后的多是劣质IP，不值得为它们建连。
-        private const int MAX_RACE_COUNT = 4;
+        // 串行尝试的候选上限。正常情况下，按「健康度 + 时延」排序后的首个 IP 就能连上，
+        // 该上限只是约束「连续多个 IP 全坏」时的最坏耗时，不是并发数量。
+        private const int MAX_TRY_COUNT = 3;
+
+        // 串行尝试候选的总建连预算（不是单IP 的预算）。
+        // <para>
+        // 单IP 预算 12s × 3 个候选 = 最坏 36s，再叠加 5xx 重试与响应等待，
+        // 实测出现过单条请求耗时 75s（POST .../rum responded 202 in 75411ms）——
+        // 请求长时间挂起会让浏览器/调用方一起卡住，用户观感就是"卡死"。
+        // 这里给整个"找一个可用 IP"的过程封顶，超时即立刻放弃并走刷新逻辑，
+        // 让失败快速暴露、尽快进入下一轮重试，而不是在一个注定失败的请求上死等。
+        /// </para>
+        private static readonly TimeSpan totalConnectBudget = TimeSpan.FromSeconds(20d);
 
         // 刷新闸门按域名隔离。
         // 原实现是一个全局 static 令牌，任意域名触发刷新会让其他域名
@@ -52,10 +64,11 @@ namespace FastGithub.Http
         /// </summary>
         /// <param name="domainConfig"></param>
         /// <param name="domainResolver"></param> 
-        public HttpClientHandler(DomainConfig domainConfig, IDomainResolver domainResolver)
+        public HttpClientHandler(DomainConfig domainConfig, IDomainResolver domainResolver, ILogger<HttpClientHandler>? logger = null)
         {
             this.domainConfig = domainConfig;
             this.domainResolver = domainResolver;
+            this.logger = logger;
             this.InnerHandler = this.CreateSocketsHttpHandler();
         }
 
@@ -78,17 +91,73 @@ namespace FastGithub.Http
             var tlsSniValue = this.domainConfig.GetTlsSniPattern().WithDomain(uri.Host).WithRandom();
             request.SetRequestContext(new RequestContext(isHttps, tlsSniValue));
 
-            // 设置请求头host，修改协议为http
+            // 设置请求头host，修改协议为http（仅做一次；重试时复用同一已转换的请求）
             request.Headers.Host = uri.Host;
             request.RequestUri = new UriBuilder(uri) { Scheme = Uri.UriSchemeHttp }.Uri;
 
-            if (this.domainConfig.Timeout != null)
+            // 整体请求预算（建连+传输+下载），按域名可覆盖；未设置则不限制单请求总时长。
+            CancellationToken effectiveToken = cancellationToken;
+            using var timeoutTokenSource = this.domainConfig.Timeout != null
+                ? new CancellationTokenSource(this.domainConfig.Timeout.Value)
+                : null;
+            using var linkedTokenSource = timeoutTokenSource != null
+                ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutTokenSource.Token)
+                : null;
+            if (linkedTokenSource != null)
             {
-                using var timeoutTokenSource = new CancellationTokenSource(this.domainConfig.Timeout.Value);
-                using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutTokenSource.Token);
-                return await base.SendAsync(request, linkedTokenSource.Token);
+                effectiveToken = linkedTokenSource.Token;
             }
-            return await base.SendAsync(request, cancellationToken);
+
+            return await this.SendWithRetryAsync(request, effectiveToken, cancellationToken);
+        }
+
+        /// <summary>
+        /// 带 5xx 自动重试地发送请求。
+        /// <para>
+        /// GitHub 边缘对 github.com / raw / codeload 等域名会间歇性返回 502/503/504
+        /// （日志中曾出现单条 502 耗时 5s、甚至 12s）。这些响应是上游"成功返回"的 HTTP 报文，
+        /// 对幂等请求（GET/HEAD）重试一次往往即可命中正常节点。
+        /// 仅在 base.SendAsync 拿到 5xx 时重试：连接层超时（AggregateException）走原有自动刷新逻辑，
+        /// 不在此空转；非幂等请求（POST/PUT 等）不重试，避免重复提交。
+        /// </para>
+        /// </summary>
+        private async Task<HttpResponseMessage> SendWithRetryAsync(HttpRequestMessage request, CancellationToken effectiveToken, CancellationToken userToken)
+        {
+            // 非幂等请求：直接透传，不重试
+            if (request.Method != HttpMethod.Get && request.Method != HttpMethod.Head)
+            {
+                return await base.SendAsync(request, effectiveToken);
+            }
+
+            // 只重试 1 次（最多 2 次尝试）：5xx 多为 GitHub 边缘瞬时过载，一次重试通常即可命中；
+            // 重试过多会放大请求量，反而更容易触发对端风控，与"减少阻断"的目标相悖。
+            // 且重试复用同一池化连接（仅在连接已死时才新建），不产生额外握手风暴。
+            const int maxAttempts = 2;
+            var backoffs = new[] { TimeSpan.FromMilliseconds(800d) };
+
+            HttpResponseMessage? response = null;
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                // 重试直接调 base（SocketsHttpHandler），跳过外层 HttpClient 的 UserAgent 校验；
+                // GET 无请求体，可安全复用同一request 对象。重试不新建并行连接、不做竞速，
+                // 由连接池复用既有连接，因此不会放大握手流量。
+                response = await base.SendAsync(request, effectiveToken);
+                var status = (int)response.StatusCode;
+
+                // 2xx/3xx/4xx 不在重试范围；仅对 5xx（网关/过载类瞬时错误）重试
+                if (response.IsSuccessStatusCode || status < 500 || attempt >= maxAttempts)
+                {
+                    return response;
+                }
+
+                this.logger?.LogWarning($"上游返回 {status}（{request.RequestUri}），第 {attempt} 次重试（共 {maxAttempts - 1} 次）");
+                response.Dispose();
+                if (attempt - 1 < backoffs.Length)
+                {
+                    await Task.Delay(backoffs[attempt - 1], userToken);
+                }
+            }
+            return response!;
         }
 
         /// <summary>
@@ -161,85 +230,61 @@ namespace FastGithub.Http
                 candidates.AddRange(blacklisted);
             }
 
-            // 并发赛马（RFC 8305 Happy Eyeballs 思路）：
-            // 原实现是串行逐个尝试，一个坏IP要等满 connectTimeout 才轮到下一个，
-            // 3 个候选全坏时用户要干等 15 秒。并发发起后取第一个握手成功的连接，
-            // 最坏耗时从 N×超时 降到 1×超时。
-            using var raceTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            var pending = new List<Task<(IPEndPoint EndPoint, Stream? Stream, bool Verified, Exception? Error)>>();
+            // 串行尝试：按「健康度 + 时延」排序后逐个连接，首个成功即返回，
+            // 随后由 SocketsHttpHandler 连接池长期复用该连接（粘性）。
+            //
+            // 【为何不能并发竞速多个 IP】
+            // 早期版本在这里并发向最多 4 个候选 IP 同时发起 TCP+TLS 握手，谁先成功用谁、
+            // 其余连接在 TLS 握手完成后立刻 Dispose（等同 RST）。这带来两个严重后果：
+            //   1) 单次请求就在多个 GitHub 边缘 IP 上同时惊扰出完整 TLS 会话又迅速丢弃，
+            //      在服务端/风控看来与端口扫描、攻击流量高度相似，是「反复被阻断」的直接原因；
+            //   2) 赢家随机、IP 频繁漂移，叠加 DoH 周期重解析与每秒测速重排，
+            //      同一域名不断换 IP，进一步触发对端风控。
+            // 基线 v2.3.x 之所以「基本不会被阻断」，正是它每次只建一条连接并保持粘性。
+            // 这里恢复该模型：慢/不通的根因交给「更准的 IP 排序 + 健康度反馈 + DoH 新鲜解析」解决，
+            // 而不是靠并发抢跑——抢占只会更快地撞上风控。
+            // 整个"找一个可用 IP"的过程封顶，避免串行逐个等超时叠加成分钟级挂起。
+            using var totalTimeoutSource = new CancellationTokenSource(totalConnectBudget);
+            using var totalTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, totalTimeoutSource.Token);
 
-            // 候选可能很多（hosts源 + DNS 补充），全部并发会同时打出大量握手。
-            // 取前面若干个即可：排序已按健康度与时延排过，后面的多是劣质IP。
-            var raceCandidates = candidates.Take(MAX_RACE_COUNT).ToArray();
-
-            for (var i = 0; i < raceCandidates.Length; i++)
+            foreach (var ipEndPoint in candidates.Take(MAX_TRY_COUNT))
             {
-                // 首个立即发起，其余错开 ~250ms（RFC 8305）。
-                // 全部同时打出去会在链路拥塞时互相拖慢，错开后通常第一个就能成功，
-                // 既拿到并发的容错又不必承担同时建连的开销。
-                if (i > 0)
+                try
                 {
-                    try
+                    using var timeoutTokenSource = new CancellationTokenSource(this.ConnectBudget);
+                    using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(timeoutTokenSource.Token, totalTokenSource.Token);
+                    var (stream, verified) = await this.ConnectAsync(context, ipEndPoint, linkedTokenSource.Token);
+
+                    // 仅在完成 TLS 握手（证书链校验通过）后才回写健康度。
+                    // 纯 http 场景只完成 TCP 连通，证明不了该IP真正可用，保持统计中性。
+                    if (verified)
                     {
-                        await Task.Delay(RACE_STAGGER, raceTokenSource.Token);
+                        this.domainResolver.ReportSuccess(context.DnsEndPoint, ipEndPoint.Address);
                     }
-                    catch (OperationCanceledException)
+                    return stream;
+                }
+                catch (OperationCanceledException)
+                {
+                    // 上层（浏览器/调用方）主动取消：如实抛出，不记为IP 失败
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    // 总预算耗尽：说明这批候选整体不可用（或网络极慢），立即停止逐个试，
+                    // 交给下面的"找不到可用IP → 触发刷新 + 重试"路径尽快恢复。
+                    if (totalTimeoutSource.IsCancellationRequested)
                     {
+                        innerExceptions.Add(new TimeoutException(
+                            $"在 {totalConnectBudget.TotalSeconds:F0}s 内未能连接 {context.DnsEndPoint.Host}（已尝试 {innerExceptions.Count} 个候选IP）"));
+                        this.logger?.LogWarning($"{context.DnsEndPoint.Host} 建连总预算耗尽，放弃剩余候选并触发IP更新");
                         break;
                     }
+
+                    this.domainResolver.ReportFailure(context.DnsEndPoint, ipEndPoint.Address);
+                    innerExceptions.Add(new HttpConnectTimeoutException(ipEndPoint.Address));
                 }
-                pending.Add(this.RaceConnectAsync(context, ipEndPoint: raceCandidates[i], raceTokenSource.Token));
-            }
-
-            try
-            {
-                while (pending.Count > 0)
+                catch (Exception ex)
                 {
-                    var completed = await Task.WhenAny(pending);
-                    pending.Remove(completed);
-
-                    var (endPoint, stream, verified, error) = await completed;
-                    if (error == null && stream != null)
-                    {
-                        // 胜出的连接已可用，取消其余仍在握手的尝试，回收 socket
-                        raceTokenSource.Cancel();
-
-                        // 仅在完成 TLS 握手（证书链校验通过）后才回写健康度。
-                        // 纯 http 场景只完成 TCP 连通，证明不了该IP真正可用——
-                        // 此时既不上报成功（会把坏IP的惩罚值洗白）也不上报失败
-                        // （TCP 确实通了，判失败同样是冤枉），保持统计中性。
-                        if (verified)
-                        {
-                            this.domainResolver.ReportSuccess(context.DnsEndPoint, endPoint.Address);
-                        }
-                        return stream;
-                    }
-
-                    if (error is OperationCanceledException)
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        this.domainResolver.ReportFailure(context.DnsEndPoint, endPoint.Address);
-                        innerExceptions.Add(new HttpConnectTimeoutException(endPoint.Address));
-                    }
-                    else if (error != null)
-                    {
-                        this.domainResolver.ReportFailure(context.DnsEndPoint, endPoint.Address);
-                        innerExceptions.Add(error);
-                    }
-                }
-            }
-            finally
-            {
-                // 未胜出的连接必须回收，否则并发赛马会泄漏 socket
-                foreach (var task in pending)
-                {
-                    _ = task.ContinueWith(t =>
-                    {
-                        if (t.IsCompletedSuccessfully)
-                        {
-                            t.Result.Stream?.Dispose();
-                        }
-                    }, TaskContinuationOptions.ExecuteSynchronously);
+                    this.domainResolver.ReportFailure(context.DnsEndPoint, ipEndPoint.Address);
+                    innerExceptions.Add(ex);
                 }
             }
 
@@ -263,9 +308,15 @@ namespace FastGithub.Http
         private async Task RefreshIpAsync(string host)
         {
             var gate = refreshGates.GetOrAdd(host, _ => new SemaphoreSlim(1, 1));
-            if (gate.Wait(0) == false)
+
+            // 【恢复速度的关键】等待而不是抢锁。
+            // 原实现用 Wait(0)：若已有刷新在进行就直接放弃返回。
+            // 但"已有刷新"恰恰意味着刚被阻断、正在恢复——此时放弃等于让这次请求
+            // 白等一轮（用户已等到超时），且若前一次刷新刚好在错误的时间点失败，
+            // 就再没有下一次机会。改为排队等待（带上限），保证恢复一定会真正执行。
+            if (await gate.WaitAsync(TimeSpan.FromSeconds(10d)) == false)
             {
-                // 该域名已有刷新在进行，避免重复触发
+                this.logger?.LogDebug($"{host} IP刷新排队超时，本次不重复触发");
                 return;
             }
 
@@ -273,8 +324,9 @@ namespace FastGithub.Http
             {
                 await this.domainResolver.RefreshAsync(CancellationToken.None);
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                this.logger?.LogWarning($"{host} IP刷新失败：{ex.Message}");
             }
             finally
             {
@@ -311,9 +363,9 @@ namespace FastGithub.Http
             var tlsSniValue = requestContext.TlsSniValue.WithIPAddress(ipEndPoint.Address);
             var sslStream = new SslStream(stream, leaveInnerStreamOpen: false);
 
-            // TLS 握手使用独立预算：TCP 已连通的情况下，
-            // 握手超时更可能意味着链路慢而非IP坏，不应与TCP失败同等对待
-            using var tlsTimeoutSource = new CancellationTokenSource(this.tlsHandshakeTimeout);
+            // TLS 握手预算与建连预算联动：若该域名被配置了更长的 ConnectTimeout（如 githubusercontent 25s），
+            // 握手自然也该放宽，否则"握手慢但服务正常"的IP会被误杀。
+            using var tlsTimeoutSource = new CancellationTokenSource(this.ConnectBudget);
             using var tlsToken = CancellationTokenSource.CreateLinkedTokenSource(tlsTimeoutSource.Token, cancellationToken);
             await sslStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
             {
@@ -339,32 +391,6 @@ namespace FastGithub.Http
                 }
 
                 return errors == SslPolicyErrors.None;
-            }
-        }
-
-        /// <summary>
-        /// 并发赛马中的单次连接尝试。
-        /// 不抛异常，把结果（成功或异常）打包返回，便于调用方取第一个成功者。
-        /// </summary>
-        /// <param name="context"></param>
-        /// <param name="ipEndPoint"></param>
-        /// <param name="cancellationToken"></param>
-        /// <returns></returns>
-        private async Task<(IPEndPoint EndPoint, Stream? Stream, bool Verified, Exception? Error)> RaceConnectAsync(
-            SocketsHttpConnectionContext context,
-            IPEndPoint ipEndPoint,
-            CancellationToken cancellationToken)
-        {
-            try
-            {
-                using var timeoutTokenSource = new CancellationTokenSource(this.connectTimeout);
-                using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(timeoutTokenSource.Token, cancellationToken);
-                var (stream, verified) = await this.ConnectAsync(context, ipEndPoint, linkedTokenSource.Token);
-                return (ipEndPoint, stream, verified, null);
-            }
-            catch (Exception ex)
-            {
-                return (ipEndPoint, null, false, ex);
             }
         }
 

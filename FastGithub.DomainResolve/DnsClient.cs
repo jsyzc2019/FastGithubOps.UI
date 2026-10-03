@@ -26,6 +26,28 @@ namespace FastGithub.DomainResolve
         private const int DNS_PORT = 53;
         private const string LOCALHOST = "localhost";
 
+        /// <summary>
+        /// 解析兜底种子表：仅在 hosts源 + DoH + 明文DNS 全部返回空时生效。
+        /// <para>
+        /// 已知 GitHub 域名若因 DoH 全端点失败、明文DNS被RST而拿不到任何IP，连接层会直接抛
+        /// "未能解析到任何可用ip" 让该域名彻底不可用（日志中 raw.githubusercontent.com 即此情况）。
+        /// 此处回退到内置的真实、长期稳定的 GitHub/Fastly 边缘IP，保证始终有候选可竞速；
+        /// 种子IP会照常经过 TCP+TLS 实测与健康度跟踪，DoH 恢复后新解析出的IP自然优先。
+        /// 这些地址为公开稳定的 CDN 边缘IP，不会引入额外安全风险。
+        /// </para>
+        /// </summary>
+        private static readonly Dictionary<string, IPAddress[]> SeedAddresses = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["github.com"] = new[] { IPAddress.Parse("20.205.243.166"), IPAddress.Parse("20.26.156.215"), IPAddress.Parse("140.82.121.3") },
+            ["api.github.com"] = new[] { IPAddress.Parse("20.205.243.166"), IPAddress.Parse("140.82.121.3"), IPAddress.Parse("140.82.113.3") },
+            ["gist.github.com"] = new[] { IPAddress.Parse("20.205.243.166"), IPAddress.Parse("140.82.121.3") },
+            ["collector.github.com"] = new[] { IPAddress.Parse("20.205.243.166"), IPAddress.Parse("140.82.121.3") },
+            ["codeload.github.com"] = new[] { IPAddress.Parse("20.205.243.166"), IPAddress.Parse("140.82.121.3") },
+            ["raw.githubusercontent.com"] = new[] { IPAddress.Parse("185.199.108.133"), IPAddress.Parse("185.199.109.133"), IPAddress.Parse("185.199.110.133"), IPAddress.Parse("185.199.111.133") },
+            ["avatars.githubusercontent.com"] = new[] { IPAddress.Parse("185.199.108.133"), IPAddress.Parse("185.199.109.133"), IPAddress.Parse("185.199.110.133"), IPAddress.Parse("185.199.111.133") },
+            ["objects.githubusercontent.com"] = new[] { IPAddress.Parse("185.199.108.133"), IPAddress.Parse("185.199.109.133"), IPAddress.Parse("185.199.110.133"), IPAddress.Parse("185.199.111.133") },
+        };
+
         private readonly DnscryptProxy dnscryptProxy;
         private readonly FastGithubConfig fastGithubConfig;
         private readonly HostsService hostsService;
@@ -63,6 +85,24 @@ namespace FastGithub.DomainResolve
             this.hostsService = hostsService;
             this.dohResolver = dohResolver;
             this.logger = logger;
+        }
+
+        /// <summary>
+        /// 使解析结果缓存失效，强制下次重新解析。
+        /// <para>
+        /// 用于「IP 被阻断后的恢复」场景：DoH 正缓存长达 10 分钟，若不失效，
+        /// 失败后触发的重解析会原样拿回同一批刚被阻断的 IP，恢复只是把坏 IP 再排一遍。
+        /// 只清解析结果缓存（IP 来源），不动 IPAddressService 的探测缓存——
+        /// 后者若一并清掉，会让每次故障都触发一轮全量重探（探测风暴）。
+        /// </para>
+        /// </summary>
+        public void InvalidateCache()
+        {
+            (this.dnsLookupCache as MemoryCache)?.Compact(1.0);
+
+            // DoH 有独立的正缓存（10 分钟），必须一并失效。
+            // 漏掉这一句会导致"恢复"完全失效：重解析仍拿回同一批被阻断的 IP。
+            this.dohResolver.InvalidateCache();
         }
 
         /// <summary>
@@ -121,6 +161,19 @@ namespace FastGithub.DomainResolve
             {
                 var addresses = await this.LookupAsync(dns, endPoint, fastSort, cancellationToken);
                 foreach (var address in addresses)
+                {
+                    if (hashSet.Add(address) == true)
+                    {
+                        yield return address;
+                    }
+                }
+            }
+
+            // 解析兜底：hosts源 + DoH + 明文DNS 全部返回空时，对已知 GitHub 域名回退到内置种子IP，
+            // 保证连接层永远有候选可竞速，避免 "未能解析到任何可用ip" 让域名彻底不可用。
+            if (hashSet.Count == 0 && SeedAddresses.TryGetValue(endPoint.Host, out var seeds))
+            {
+                foreach (var address in seeds)
                 {
                     if (hashSet.Add(address) == true)
                     {

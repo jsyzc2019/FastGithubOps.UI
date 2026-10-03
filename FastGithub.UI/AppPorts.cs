@@ -23,8 +23,20 @@ namespace FastGithub.UI
 
         /// <summary>
         /// UI内部通信的HTTP基地址
+        /// <para>
+        /// 【重要】必须用惰性属性，不能写成静态字段初始化。
+        /// 原实现把它声明在 <see cref="UiHttpPort"/> 之前并直接插值：
+        /// <c>public static string UiHttpBaseUrl { get; } = $"http://127.0.0.1:{UiHttpPort}";</c>
+        /// C# 静态字段/属性按声明顺序初始化，插值时 <see cref="UiHttpPort"/> 仍是默认值 0，
+        /// 于是 BaseUrl 恒为 "http://127.0.0.1:0"。
+        /// 而主程序监听的是真实端口（UI 通过 --UiHttpPort 传入），
+        /// 两端端口对不上，UI 的所有内部 HTTP 调用都会抛 HttpRequestException
+        /// （已实测复现：BaseUrl 最终值为 http://127.0.0.1:0）。
+        /// 症状是"流量图不显示"且"更新IP 按钮无效"，且日志里看不到任何服务端错误，
+        /// 极难定位——已改为惰性求值，读取时才计算，与声明顺序完全无关。
+        /// </para>
         /// </summary>
-        public static string UiHttpBaseUrl { get; } = $"http://127.0.0.1:{UiHttpPort}";
+        public static string UiHttpBaseUrl => $"http://127.0.0.1:{UiHttpPort}";
 
         /// <summary>
         /// UI内部通信端口

@@ -30,9 +30,20 @@ namespace FastGithub.Configuration
         public IPAddress? IPAddress { get; init; }
 
         /// <summary>
-        /// 请求超时时长
+        /// 请求超时时长（整体：建连+传输+下载的总预算）
         /// </summary>
         public TimeSpan? Timeout { get; init; }
+
+        /// <summary>
+        /// 单个候选IP的建连（TCP+TLS）预算。
+        /// <para>
+        /// 跨境链路 RTT 差异极大：github.com 交互请求常在 5s 左右，而
+        /// raw.githubusercontent.com / codeload.github.com 这类承载大文件、git 对象的域名
+        /// 单条 502 就曾耗时 12s+。若所有域名共用一份建连预算，慢域名的新鲜连接会被误杀。
+        /// 这里允许按域名覆盖；未设置时回退到 HttpClientHandler / IPAddressService 的默认值。
+        /// </para>
+        /// </summary>
+        public TimeSpan? ConnectTimeout { get; init; }
 
         /// <summary>
         /// 目的地

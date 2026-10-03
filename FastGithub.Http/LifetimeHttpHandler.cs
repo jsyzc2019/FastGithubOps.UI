@@ -21,10 +21,10 @@ namespace FastGithub.Http
         /// <param name="lifeTimeKey"></param>
         /// <param name="lifeTime"></param>
         /// <param name="deactivateAction"></param>
-        public LifetimeHttpHandler(IDomainResolver domainResolver, LifeTimeKey lifeTimeKey, TimeSpan lifeTime, Action<LifetimeHttpHandler> deactivateAction)
+        public LifetimeHttpHandler(IDomainResolver domainResolver, LifeTimeKey lifeTimeKey, TimeSpan lifeTime, Action<LifetimeHttpHandler> deactivateAction, Microsoft.Extensions.Logging.ILogger<HttpClientHandler>? logger = null)
         {
             this.LifeTimeKey = lifeTimeKey;
-            this.InnerHandler = new HttpClientHandler(lifeTimeKey.DomainConfig, domainResolver);
+            this.InnerHandler = new HttpClientHandler(lifeTimeKey.DomainConfig, domainResolver, logger);
             this.timer = new Timer(this.OnTimerCallback, deactivateAction, lifeTime, Timeout.InfiniteTimeSpan);
         }
 
