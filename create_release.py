@@ -18,6 +18,15 @@ API = f"https://api.github.com/repos/{OWNER}/{REPO}"
 UPLOADS = "https://uploads.github.com"
 TOKEN = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
 
+# Release 正文的兜底文案。正常路径应读取 release-notes/<tag>.md，
+# 仅当该文件缺失时才用这份内嵌副本，保证脚本可独立运行。
+FALLBACK_NOTES = """## FastGithubOps.UI（仅 win-x64）
+
+解压后运行 `FastGithub.UI.exe`，首次使用请以管理员身份运行以自动导入 CA 证书。
+
+本版本的完整变更说明见 `release-notes/` 目录。
+"""
+
 
 def request(method, url, data=None, headers=None):
     req = urllib.request.Request(url, data=data, method=method)
@@ -51,56 +60,19 @@ def main():
     tag = sys.argv[1]
     files = sys.argv[2:]
 
-    notes = """## FastGithubOps.UI v2.5.6（仅 win-x64）
+    # Release 正文优先取 release-notes/<tag>.md（单一事实来源，可版本管理）；
+    # 缺失时回退到脚本内嵌的 FALLBACK_NOTES。
+    notes_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "release-notes", f"{tag}.md"
+    )
+    if os.path.isfile(notes_path):
+        with open(notes_path, encoding="utf-8") as f:
+            notes = f.read()
+        print(f"Release 正文取自 {notes_path}")
+    else:
+        notes = FALLBACK_NOTES
+        print(f"警告：未找到 {notes_path}，回退到脚本内嵌说明")
 
-### 机制性回退：不再被反复阻断
-
-**问题**
-v2.5.0~v2.5.3 在部分网络下反复被阻断，体感明显差于基线 v2.3.1。
-根因不在超时，而在自设机制：单次请求并发向 4 个 GitHub 边缘 IP 惊扰出完整 TLS
-会话后丢弃，叠加后台每秒一轮的 TLS 探测风暴，形似端口扫描而被对端限流。
-
-**修复**
-- 删除请求层并发赛马，改回串行尝试（`MAX_TRY_COUNT = 3`），并加 20s 总建连预算。
-- IP 探测从 TLS 握手降级为纯 TCP 握手，探测频率与强度回到基线水平。
-- 失败时不再清空探测缓存（此前会形成「连不上→清缓存→全量重探→更像攻击」的
-  正反馈死循环），改为失效 DNS 解析缓存。
-
-### 恢复速度：被阻断后尽快可用
-
-- 恢复链路四个环节串联压缩：健康度拉黑阈值 3→2、黑名单时长 5min→30s、
-  刷新冷却 30s→10s、解析缓存主动失效。
-- 5xx 自动重试一次（退避 800ms）。
-- `DnsClient.InvalidateCache()` 同时失效明文 DNS 与 DoH 缓存。
-
-### 两个隐性bug（实测确认修复）
-
-- **DoH 报文字节序**：原用 `BinaryWriter.Write(ushort)` 写 DNS 报文，那是小端序，
-  而 DNS 协议要求大端，导致四个 DoH 端点全部返回 HTTP 400、DoH 形同虚设。
-  改为显式逐字节大端写入后，5 个域名 A/AAAA 全部 200。
-- **UI 内部端口恒为 0**：`AppPorts.UiHttpBaseUrl` 声明在 `UiHttpPort` 之前且用插值
-  初始化，C# 静态成员按声明顺序初始化，导致流量图与「更新IP」永远请求
-  `http://127.0.0.1:0/...`。改为惰性属性后恢复。
-
-### 其他
-
-- hosts 源接入 IP 有效性过滤，修复 `avatars.githubusercontent.com -> 127.0.0.1`
-  这类污染地址被当作真实 IP 写入。
-- 流量图读取失败时不再静默吞异常，界面直接显示异常类型，便于定位。
-
-### 实测对比（同一网络环境）
-
-| 指标 | v2.5.5 | v2.5.6 |
-|---|---|---|
-| DoH 解析成功 | 0 | 53 |
-| DoH 解析失败 | 33 | 0 |
-| HTTP 200 | 28 | 157 |
-| `[ERR]` 日志 | 0 | 0 |
-
-### 使用
-
-解压后运行 `FastGithub.UI.exe`，首次使用请以管理员身份运行以自动导入 CA 证书。
-"""
 
     release = request("POST", f"{API}/releases", {
         "tag_name": tag,
