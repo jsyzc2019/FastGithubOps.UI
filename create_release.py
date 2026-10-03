@@ -51,49 +51,61 @@ def main():
     tag = sys.argv[1]
     files = sys.argv[2:]
 
-    notes = """## FastGithub v2.5.0（仅 win-x64）
+    notes = """## FastGithubOps.UI v2.5.6（仅 win-x64）
 
-### 本版重点：连通性与速度
+### 机制性回退：不再被反复阻断
 
-**修复发布包缺失 UI**
-- v2.4.1 的包里只有 `fastgithub.exe`，`FastGithub.UI.exe` 与其 `.config` 全部丢失。
-  现在主程序与 UI 发布到同一目录，并在 CI 中增加发布后校验，缺文件直接失败。
+**问题**
+v2.5.0~v2.5.3 在部分网络下反复被阻断，体感明显差于基线 v2.3.1。
+根因不在超时，而在自设机制：单次请求并发向 4 个 GitHub 边缘 IP 惊扰出完整 TLS
+会话后丢弃，叠加后台每秒一轮的 TLS 探测风暴，形似端口扫描而被对端限流。
 
-**候选 IP 从 1 个扩展到多个**
-- 此前被在线 hosts 源覆盖的域名永远只有源里那唯一一个候选 IP，它一坏就没有任何备选。
-  改为 hosts 源 IP 优先 + DNS 结果补充。实测（`/connectivity`）：
-  - `github.com` 由不可达变为可达（267ms）
-  - `codeload.github.com` 322ms → 217ms（选到更快的 IP）
-  - 可达域名数 3/6 → 4/6
+**修复**
+- 删除请求层并发赛马，改回串行尝试（`MAX_TRY_COUNT = 3`），并加 20s 总建连预算。
+- IP 探测从 TLS 握手降级为纯 TCP 握手，探测频率与强度回到基线水平。
+- 失败时不再清空探测缓存（此前会形成「连不上→清缓存→全量重探→更像攻击」的
+  正反馈死循环），改为失效 DNS 解析缓存。
 
-**测速改为 TLS 层验证**
-- 原先只做 TCP 握手，会选出「连得上但用不了」的 IP（TLS 层被干扰时 TCP 层仍表现成功）。
-  现在对 443/8443 端口追加真实 TLS 握手探测，且使用独立的超时预算。
+### 恢复速度：被阻断后尽快可用
 
-**连接由串行改为并发赛马**
-- 原先逐个尝试候选 IP，一个坏 IP 要等满超时才轮到下一个。
-  现在并发发起、取第一个握手成功者，最坏耗时从 N×超时降到 1×超时。
+- 恢复链路四个环节串联压缩：健康度拉黑阈值 3→2、黑名单时长 5min→30s、
+  刷新冷却 30s→10s、解析缓存主动失效。
+- 5xx 自动重试一次（退避 800ms）。
+- `DnsClient.InvalidateCache()` 同时失效明文 DNS 与 DoH 缓存。
 
-**TCP 参数统一调优**
-- `NoDelay = true`：git/SSH 的小包交互流不再被 Nagle 攒包拖慢。
-- 收发缓冲区 64KB → 256KB：改善跨境大文件（release 附件、git pack）吞吐。
-- HTTP 连接池：空闲连接保留 3 分钟，复用可省掉每次 TCP+TLS 往返。
-- SSH/Git 反代补上健康度反馈，不再反复选中同一个坏 IP。
+### 两个隐性bug（实测确认修复）
 
-### 可诊断性
-- 新增 `/connectivity`：主动探测 GitHub 各域名，返回是否可达、候选 IP 数、
-  中选 IP 与握手耗时。支持 `?host=a,b` 自定义目标。
-- `/diagnostics`：CA 证书是否被信任、各端口实际监听值、IP 健康度快照。
-- 修复 UI 与主程序的端口静契约：UI 硬编码 45678 而主程序动态选端口，
-  端口被占时 UI 的流量图表与「更新IP」会静默失效。
+- **DoH 报文字节序**：原用 `BinaryWriter.Write(ushort)` 写 DNS 报文，那是小端序，
+  而 DNS 协议要求大端，导致四个 DoH 端点全部返回 HTTP 400、DoH 形同虚设。
+  改为显式逐字节大端写入后，5 个域名 A/AAAA 全部 200。
+- **UI 内部端口恒为 0**：`AppPorts.UiHttpBaseUrl` 声明在 `UiHttpPort` 之前且用插值
+  初始化，C# 静态成员按声明顺序初始化，导致流量图与「更新IP」永远请求
+  `http://127.0.0.1:0/...`。改为惰性属性后恢复。
+
+### 其他
+
+- hosts 源接入 IP 有效性过滤，修复 `avatars.githubusercontent.com -> 127.0.0.1`
+  这类污染地址被当作真实 IP 写入。
+- 流量图读取失败时不再静默吞异常，界面直接显示异常类型，便于定位。
+
+### 实测对比（同一网络环境）
+
+| 指标 | v2.5.5 | v2.5.6 |
+|---|---|---|
+| DoH 解析成功 | 0 | 53 |
+| DoH 解析失败 | 33 | 0 |
+| HTTP 200 | 28 | 157 |
+| `[ERR]` 日志 | 0 | 0 |
 
 ### 使用
+
 解压后运行 `FastGithub.UI.exe`，首次使用请以管理员身份运行以自动导入 CA 证书。
 """
 
     release = request("POST", f"{API}/releases", {
         "tag_name": tag,
-        "name": f"FastGithub {tag}",
+        "target_commitish": os.environ.get("TARGET_COMMIT", "main"),
+        "name": f"FastGithubOps.UI {tag}",
         "body": notes,
         "draft": False,
         "prerelease": False,
