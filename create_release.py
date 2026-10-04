@@ -29,6 +29,16 @@ FALLBACK_NOTES = """## FastGithubOps.UI（仅 win-x64）
 
 
 def request(method, url, data=None, headers=None):
+    # 允许调用者直接传 dict/str，由本函数统一编码成 bytes。
+    # 【v2.6.7 修复】此前本函数假定 data 一定是 bytes，把 dict 直接透传给
+    # urllib.Request，于是创建 Release 时抛
+    # TypeError: can't concat str to bytes（urllib 内部拼 chunk 头时类型不匹配）。
+    # 注意：bytes 不能再被 json 二次编码，必须原样透传。
+    if isinstance(data, (dict, list)):
+        data = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    elif isinstance(data, str):
+        data = data.encode("utf-8")
+
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Authorization", f"token {TOKEN}")
     req.add_header("Accept", "application/vnd.github+json")

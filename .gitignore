@@ -365,3 +365,6 @@ FodyWeavers.xsd
 release_v*
 *.zip
 *.sha256
+
+# 分卷上传产物（每卷 <=7MB，拼接后即发布包本身）
+fastgithub-win-x64-*.zip.part*
