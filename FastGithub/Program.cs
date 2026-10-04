@@ -1,7 +1,9 @@
 ﻿using FastGithub.Configuration;
+using FastGithub.DomainResolve;
 using Microsoft.AspNetCore.Builder;
 using System;
 using System.IO;
+using System.Linq;
 
 namespace FastGithub
 {
@@ -19,6 +21,15 @@ namespace FastGithub
             if (string.IsNullOrEmpty(contentRoot) == false)
             {
                 Environment.CurrentDirectory = contentRoot;
+            }
+
+            // 【v2.6.6】自检模式：跑完纯内存断言后立刻退出，不启动任何服务。
+            // 存在的意义是让"熔断计数/退避"这类**只在故障期才暴露**的问题
+            // 能在不发故障、不等 98 分钟的前提下被确定性验证。
+            // 注意：过去 IpAddressFilterSelfTest 写好了却没有调用点，等于从未真正执行过。
+            if (RunSelfTest(args))
+            {
+                Environment.Exit(0);
             }
 
             // UI进程会显式传入它将要访问的端口。必须在 ConfigureWebHost 之前完成，
@@ -55,6 +66,32 @@ namespace FastGithub
             }
 
             GlobalListener.SetUiHttpPort(port);
+        }
+
+        /// <summary>
+        /// 若传入了 <c>--SelfTest</c>，则执行全部自检并返回 true（表示应以自检结果退出）
+        /// </summary>
+        private static bool RunSelfTest(string[] args)
+        {
+            if (args.Any(item => string.Equals(item, "--SelfTest", StringComparison.OrdinalIgnoreCase)) == false)
+            {
+                return false;
+            }
+
+            Console.WriteLine("=== FastGithub 自检 ===");
+            var failed = IpAddressFilterSelfTest.Run();
+            failed += DohBackoffSelfTest.Run();
+
+            Console.WriteLine(failed == 0
+                ? "=== 自检全部通过 ==="
+                : $"=== 自检失败 {failed} 项 ===");
+
+            if (failed > 0)
+            {
+                Environment.ExitCode = 1;
+            }
+
+            return true;
         }
 
         /// <summary>

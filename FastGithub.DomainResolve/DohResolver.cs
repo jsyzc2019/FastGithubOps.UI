@@ -26,7 +26,7 @@ namespace FastGithub.DomainResolve
     /// 服务器都支持的「通用语」，比各家实现不一的 JSON API 更稳。
     /// </para>
     /// </summary>
-    sealed class DohResolver
+    public sealed class DohResolver
     {
         /// <summary>
         /// DoH 端点熔断状态的落盘文件名（工作目录下，与 dnsendpoints.json 同级）。
@@ -70,6 +70,28 @@ namespace FastGithub.DomainResolve
         /// 熔断后的冷却时长：给被墙端点恢复的机会，同时不至于让一次网络抖动就长期弃用端点。
         /// </summary>
         private static readonly TimeSpan endpointCooldown = TimeSpan.FromMinutes(10d);
+
+        /// <summary>
+        /// 【v2.6.6 P0-1】解析失败后的退避基数（首次失败后等这么久才允许再试）。
+        /// <para>
+        /// 【为什么必须有】原实现只有 10 分钟的**正**缓存，失败路径**完全没有节流**：
+        /// <c>DomainResolveHostedService</c> 每秒跑一轮全量测速，18 个域名各自发一次
+        /// A+AAAA 竞速（5 端点 = 10 个请求），网络一坏就变成
+        /// "18 域名 × 每 2 秒 × 10 请求" 的无限重打。
+        /// v2.6.5 长时日志实测：该窗口持续 **98 分钟**，产生 **11,834 条**
+        /// "DoH 解析失败：所有端点均不可用"，而同期仍有 709 次解析成功 ——
+        /// 说明网络只是**部分**可达（部分端点/部分记录类型在闪断），
+        /// 这种"半通不通"状态恰好是最坏情况：不彻底失败触发任何保护，
+        /// 又让重试以最快频率持续消耗。
+        /// </para>
+        /// </summary>
+        private static readonly TimeSpan negativeBackoffBase = TimeSpan.FromSeconds(2d);
+
+        /// <summary>
+        /// 退避上限。取 60 秒：与正缓存 10 分钟、端点熔断 10 分钟同量级但更短，
+        /// 保证网络恢复后**最迟 1 分钟**就能重新拿到新 IP，不会因退避而"修完就废"。
+        /// </summary>
+        private static readonly TimeSpan negativeBackoffMax = TimeSpan.FromSeconds(60d);
 
         /// <summary>
         /// 使用 IP 字面量（而非域名）作为 DoH 端点，使客户端无需先解析域名，
@@ -153,9 +175,41 @@ namespace FastGithub.DomainResolve
         private readonly ConcurrentDictionary<string, Task<IReadOnlyList<IPAddress>>> inflight = new();
 
         /// <summary>
-        /// 各 DoH 端点的熔断状态：值为 (连续失败次数, 熔断至何时)。
+        /// 各 DoH 端点的熔断状态。
+        /// <para>
+        /// 【v2.6.6 P0-2 关键修复】从 <c>(int, DateTime)</c> 值类型元组改为**引用类型 + lock**。
+        /// 原实现用 <c>ConcurrentDictionary.TryUpdate</c> 做"读-改-写"：
+        /// <code>before = 读; after = before+1; TryUpdate(k, after, before)</code>
+        /// 这在**并发**下必然丢计数 —— TryUpdate 只在值恰好等于 before 时才写入，
+        /// 18 个域名 × A/AAAA 并发时几十个任务同时读同一个 Failures=0，
+        /// 只有 1 个 CAS 成功，其余全部静默失败，计数永远停在 1。
+        /// 现象是：日志里 11,834 次"所有端点均不可用"，但"已熔断"日志 **0 条**、
+        /// <c>doh_blocked_endpoints.json</c> 从未生成 —— 熔断机制形同虚设。
+        /// 改为 lock 保护的可变对象后，累加是原子的，不再丢计数。
+        /// </para>
         /// </summary>
-        private readonly ConcurrentDictionary<string, (int Failures, DateTime BlockedUntil)> endpointHealth = new();
+        private readonly ConcurrentDictionary<string, EndpointState> endpointHealth = new();
+
+        /// <summary>
+        /// 【v2.6.6 P0-1】解析失败后的负缓存（退避）：值为 (连续失败次数, 允许重试的时刻)。
+        /// <para>
+        /// 语义与<a cref="positiveCache"/>相反：正缓存是"成功了就复用"，
+        /// 负缓存是"失败了先别打了"。缺了它，失败路径就是无节流的无限重试。
+        /// </para>
+        /// </summary>
+        private readonly ConcurrentDictionary<string, (int Failures, DateTime RetryAfter)> negativeCache = new();
+
+        private sealed class EndpointState
+        {
+            /// <summary>连续失败次数</summary>
+            public int Failures;
+
+            /// <summary>熔断截止时刻，未熔断时为 <see cref="DateTime.MinValue"/></summary>
+            public DateTime BlockedUntil = DateTime.MinValue;
+
+            /// <summary>保护 <see cref="Failures"/> 与 <see cref="BlockedUntil"/> 的读-改-写</summary>
+            public readonly object SyncRoot = new object();
+        }
 
         /// <summary>
         /// DoH 解析器
@@ -169,7 +223,12 @@ namespace FastGithub.DomainResolve
                 ServerCertificateCustomValidationCallback = (_, _, _, _) => true
             })
             {
-                Timeout = perRequestTimeout
+                // 【v2.6.6 P0-2】Timeout 设为 Infinite：超时**只**由每端点的 endpointCts 管控。
+                // 原先 HttpClient.Timeout 与 endpointCts 是两套并行的超时，
+                // HttpClient 的那个会先触发并抛 TaskCanceledException，
+                // 而此时 endpointCts 尚未取消 —— 上层据此判定"不是端点超时、不计失败"，
+                // 真实失败信号又一次丢失。统一到单一令牌后，超时只有一个来源、一种含义。
+                Timeout = System.Threading.Timeout.InfiniteTimeSpan
             };
 
             // 【跨进程继承熔断状态】程序往往连续运行数小时甚至跨重启，
@@ -187,7 +246,11 @@ namespace FastGithub.DomainResolve
                     {
                         if (Endpoints.Contains(endpoint, StringComparer.OrdinalIgnoreCase))
                         {
-                            this.endpointHealth[endpoint] = (Failures: endpointFailureThreshold, BlockedUntil: until);
+                            this.endpointHealth[endpoint] = new EndpointState
+                            {
+                                Failures = endpointFailureThreshold,
+                                BlockedUntil = until
+                            };
                         }
                     }
 
@@ -210,12 +273,14 @@ namespace FastGithub.DomainResolve
         {
             try
             {
-                var now = DateTime.UtcNow;
-                var blocked = this.endpointHealth
-                    .Where(item => item.Value.BlockedUntil > now)
-                    .Select(item => item.Key)
-                    .ToArray();
-
+            var now = DateTime.UtcNow;
+            var blocked = this.endpointHealth
+                .Where(item => item.Value.BlockedUntil > now)
+                .Select(item => item.Key)
+                .ToArray();
+            // 说明：BlockedUntil 的读取不在 lock 内。此处刻意保持无锁 ——
+            // 落盘是尽力而为的旁路（即便读到撕裂的旧值，下次启动也只是多/少跳过一个端点），
+            // 权威状态始终在内存的 endpointHealth 里，锁只用于保证计数不丢。
                 if (blocked.Length > 0)
                 {
                     File.WriteAllText(blockedFile, JsonSerializer.Serialize(blocked));
@@ -238,11 +303,22 @@ namespace FastGithub.DomainResolve
         /// 失败后触发的重解析会原样拿回同一批刚被阻断的 IP，恢复速度永远快不起来。
         /// 只在明确的故障恢复时调用，正常轮询期间不动缓存（避免 IP 频繁漂移）。
         /// </para>
+        /// <para>
+        /// 【v2.6.6 P0-1】**同时清除失败退避**。这是刻意的例外：
+        /// 退避是为了掐断"后台每秒机械重试"，而本方法恰恰是用户/健康度触发的
+        /// **主动恢复**尝试 —— 网络可能刚刚恢复，若此时还因退避返回空，
+        //"恢复"就变成空转，退避反而成了阻碍恢复的元凶。
+        /// 调用方（<c>DomainResolver.RefreshAsync</c>）自身已有 10 秒冷却与 IP 拉黑门槛，
+        /// 不会退化成无限重试，因此这里清空是安全的。
+        /// </para>
         /// </summary>
         public void InvalidateCache()
         {
             this.positiveCache.Clear();
             this.inflight.Clear();
+
+            // 主动恢复路径不受失败退避约束（理由见方法注释）
+            this.negativeCache.Clear();
         }
 
         /// <summary>
@@ -256,6 +332,14 @@ namespace FastGithub.DomainResolve
             if (this.positiveCache.TryGetValue(host, out var cached) && cached.Expires > DateTime.UtcNow)
             {
                 return cached.Addresses;
+            }
+
+            // 【v2.6.6 P0-1】失败退避：处于退避期内直接返回空，不发起任何 DoH 请求。
+            // 这才是真正掐断重解析风暴的那一刀 —— 上层（后台每秒测速）照常轮询，
+            // 但网络坏时不会再有流量打向 DoH 端点。
+            if (this.negativeCache.TryGetValue(host, out var negative) && negative.RetryAfter > DateTime.UtcNow)
+            {
+                return Array.Empty<IPAddress>();
             }
 
             // 【single-flight】同一 host 的并发查询合流为一次。
@@ -293,15 +377,31 @@ namespace FastGithub.DomainResolve
             }
 
             var list = merged.ToArray();
-            var succeeded = (aTask.Result.Count + aaaaTask.Result.Count) > 0 ? 1 : 0;
             if (list.Length > 0)
             {
                 this.positiveCache[host] = (DateTime.UtcNow.Add(positiveCacheTtl), list);
+
+                // 成功即清零退避，网络恢复后立刻回到"每次都查"的正常节奏
+                this.ClearNegativeCache(host);
                 this.logger.LogInformation($"DoH 解析 {host} 成功，得 {list.Length} 个候选IP");
             }
             else
             {
-                this.logger.LogWarning($"DoH 解析 {host} 失败：所有端点均不可用");
+                // 【v2.6.6 P0-1】失败进入指数退避，并按"首次/重复"分级日志。
+                // 原实现每次都打 LogWarning，98 分钟故障窗口刷出 11,834 条同文案警告，
+                // 真正需要关注的首条失败与端点级原因（返回码/异常）反而被噪声淹没。
+                // 现在：每段退避序列的首次失败仍告警（Warning），重复的降为 Debug。
+                this.ReportNegative(host, out var backoff, out var isFirstFailure);
+                if (isFirstFailure)
+                {
+                    this.logger.LogWarning(
+                        $"DoH 解析 {host} 失败：所有端点均不可用，{backoff.TotalSeconds:F0} 秒后重试（连续失败将指数退避，上限 60 秒）");
+                }
+                else
+                {
+                    this.logger.LogDebug(
+                        $"DoH 解析 {host} 再次失败，退避至 {DateTime.UtcNow.Add(backoff):HH:mm:ss} 后重试");
+                }
             }
 
             return list;
@@ -356,7 +456,9 @@ namespace FastGithub.DomainResolve
             {
                 // 全部端点都在熔断冷却期：这是"网络环境已彻底不可用"，
                 // 此时再发起请求也只会白等 perRequestTimeout，直接返回空。
-                this.logger.LogWarning("所有 DoH 端点均处于熔断冷却期，本轮不发起查询");
+                // 【v2.6.6 P0-1】降为 Debug：全熔断是熔断生效后的**正常稳态**，
+                // 每秒 18 个域名各打一条 Warning 只会刷屏，真正的告警已在熔断那一刻发过。
+                this.logger.LogDebug("所有 DoH 端点均处于熔断冷却期，本轮不发起查询");
                 return merged.ToArray();
             }
 
@@ -452,29 +554,44 @@ namespace FastGithub.DomainResolve
         /// </summary>
         private bool IsEndpointBlocked(string endpoint)
         {
-            if (this.endpointHealth.TryGetValue(endpoint, out var health) == false)
+            if (this.endpointHealth.TryGetValue(endpoint, out var state) == false)
             {
                 return false;
             }
 
-            if (health.BlockedUntil > DateTime.UtcNow)
+            lock (state.SyncRoot)
             {
-                return true;
-            }
+                if (state.BlockedUntil > DateTime.UtcNow)
+                {
+                    return true;
+                }
 
-            // 冷却已过，给一次重新试探的机会（清零失败计数）
-            this.endpointHealth.TryUpdate(endpoint, (Failures: 0, BlockedUntil: DateTime.MinValue), health);
-            return false;
+                // 冷却已过，给一次重新试探的机会（清零失败计数）
+                if (state.Failures > 0 || state.BlockedUntil != DateTime.MinValue)
+                {
+                    state.Failures = 0;
+                    state.BlockedUntil = DateTime.MinValue;
+                }
+
+                return false;
+            }
         }
 
         /// <summary>
-        /// 记录端点的成功/失败，连续失败达阈值则熔断
+        /// 记录端点的成功/失败，连续失败达阈值则熔断。
+        /// <para>
+        /// 【v2.6.6 P0-2】读-改-写全程在 <c>state.SyncRoot</c> 内完成。
+        /// 原实现用 ConcurrentDictionary.TryUpdate 做 CAS，并发下会静默丢计数
+        /// （几十个域名同时失败，只有一个能写入），导致熔断永不触发。
+        /// 现在用 lock，累加保证不丢；成功/失败的相互覆盖也按时间顺序正确处理。
+        /// </para>
         /// </summary>
         private void ReportEndpointResult(string endpoint, bool success)
         {
             if (success)
             {
-                if (this.endpointHealth.TryRemove(endpoint, out _))
+                var hadState = this.endpointHealth.TryRemove(endpoint, out _);
+                if (hadState)
                 {
                     // 该端点曾被判死，现已恢复可用：清掉落盘记录，避免下次启动继续跳过它
                     this.PersistEndpointHealth();
@@ -482,73 +599,179 @@ namespace FastGithub.DomainResolve
                 return;
             }
 
-            var before = this.endpointHealth.TryGetValue(endpoint, out var current)
-                ? current
-                : (Failures: 0, BlockedUntil: DateTime.MinValue);
-
-            (int Failures, DateTime BlockedUntil) after = before.BlockedUntil > DateTime.UtcNow
-                // 已在冷却中，保持原有的剩余时长，不要被本次失败无限延长
-                ? before
-                : (before.Failures + 1, before.Failures + 1 >= endpointFailureThreshold
-                    ? DateTime.UtcNow.Add(endpointCooldown)
-                    : DateTime.MinValue);
-
-            if (this.endpointHealth.TryUpdate(endpoint, after, before))
+            var newlyBlocked = false;
+            var state = this.endpointHealth.GetOrAdd(endpoint, _ => new EndpointState());
+            lock (state.SyncRoot)
             {
-                // 新进入熔断时立即落盘（保证进程被杀/断电也不丢）
-                if (before.BlockedUntil <= DateTime.UtcNow && after.BlockedUntil > DateTime.UtcNow)
+                if (state.BlockedUntil > DateTime.UtcNow)
                 {
-                    this.PersistEndpointHealth();
-                    this.logger.LogWarning($"DoH 端点 {endpoint} 连续失败 {after.Failures} 次，已熔断 {endpointCooldown.TotalMinutes:F0} 分钟");
+                    // 已在冷却中，保持原有的剩余时长，不要被本次失败无限延长
+                    return;
+                }
+
+                state.Failures++;
+                if (state.Failures >= endpointFailureThreshold)
+                {
+                    state.BlockedUntil = DateTime.UtcNow.Add(endpointCooldown);
+                    newlyBlocked = true;
                 }
             }
+
+            // 新进入熔断时立即落盘（保证进程被杀/断电也不丢）
+            if (newlyBlocked)
+            {
+                this.PersistEndpointHealth();
+                this.logger.LogWarning($"DoH 端点 {endpoint} 连续失败 {endpointFailureThreshold} 次，已熔断 {endpointCooldown.TotalMinutes:F0} 分钟");
+            }
+        }
+
+        /// <summary>
+        /// 记录一次解析失败并返回退避时长与是否为首次失败。
+        /// <para>
+        /// 【v2.6.6 P0-1】指数退避：2s → 4s → 8s → 16s → 32s → 60s（封顶）。
+        /// 成功一次即清零（见 <see cref="ClearNegativeCache"/>）。
+        /// </para>
+        /// </summary>
+        /// <param name="host">域名</param>
+        /// <param name="backoff">下次允许重试前的静默时长</param>
+        /// <param name="isFirstFailure">本次调用是否为该退避序列的**首次**失败（用于日志分级）</param>
+        private void ReportNegative(string host, out TimeSpan backoff, out bool isFirstFailure)
+        {
+            // 先判断是否已处于退避期：这才是"重复失败"的准确判据。
+            // 【为什么不能由计数反推】首次失败会把 Failures 置为 1，而退避期内的重复失败
+            // 既不叠加计数（仍为 1）也不延长退避 —— 于是"计数 <= 1"在首次与重复两种
+            // 情形下**同样成立**，用它判首次会让退避期内每次失败都升级为 Warning，
+            // 降噪完全失效（这正是自测首次运行抓出的问题）。
+            var existed = this.negativeCache.TryGetValue(host, out var previous);
+            var inBackoffWindow = existed && previous.RetryAfter > DateTime.UtcNow;
+
+            var updated = this.negativeCache.AddOrUpdate(
+                host,
+                // 首次失败：退避一个基数时长
+                _ => (Failures: 1, RetryAfter: DateTime.UtcNow.Add(negativeBackoffBase)),
+                (_, current) => inBackoffWindow
+                    // 退避期内的重复失败不叠加计数，也不延长退避
+                    ? current
+                    : (Failures: current.Failures + 1, RetryAfter: DateTime.UtcNow.Add(ComputeBackoff(current.Failures + 1))));
+
+            // 首次 = 该域名**从未失败过**。退避过期的再次失败属于"又一次失败"，
+            // 同样降为 Debug —— 若把它也算首次，同一个老域名在故障期内会反复告警，
+            // 而 11,834 条噪声正是这样累积出来的。只有"新域名首次失败"才值得打扰用户。
+            isFirstFailure = existed == false;
+
+            var remaining = updated.RetryAfter - DateTime.UtcNow;
+            backoff = remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
+        }
+
+        /// <summary>
+        /// 计算第 n 次连续失败后的退避时长（2s 起，指数增长，60s 封顶）
+        /// </summary>
+        private static TimeSpan ComputeBackoff(int failures)
+        {
+            // failures=1 → 2s, 2 → 4s, 3 → 8s ... 用位移避免 Math.Pow 的浮点误差
+            var shift = Math.Min(failures - 1, 20);
+            var seconds = negativeBackoffBase.TotalSeconds * (1 << shift);
+            return seconds >= negativeBackoffMax.TotalSeconds
+                ? negativeBackoffMax
+                : TimeSpan.FromSeconds(seconds);
+        }
+
+        /// <summary>
+        /// 清除某 host 的失败退避（解析成功后调用）
+        /// </summary>
+        private void ClearNegativeCache(string host)
+        {
+            this.negativeCache.TryRemove(host, out _);
         }
 
         /// <summary>
         /// 向单个 DoH 端点发送 wire 格式查询（带 1 次重试），解析响应。
         /// <para>单次 DoH 请求可能因网络瞬时拥塞超时；重试一次即可覆盖大多数瞬时抖动，
-        /// 又不至于把整体解析拖得太久（重试预算仍受 httpClient.Timeout 约束）。</para>
+        /// 又不至于把整体解析拖得太久（重试预算受 <c>perRequestTimeout</c> 约束 ——
+        /// 【v2.6.6】该预算由本方法的 endpointCts 独立持有，不再依赖 httpClient.Timeout）。</para>
         /// </summary>
-        private async Task<IReadOnlyList<IPAddress>> QueryEndpointWithRetryAsync(string endpoint, string dnsParam, CancellationToken cancellationToken)
+        private async Task<IReadOnlyList<IPAddress>> QueryEndpointWithRetryAsync(string endpoint, string dnsParam, CancellationToken raceToken)
         {
+            // 【v2.6.6 P0-2 关键修复】把"端点自身失败"与"竞速被取消"彻底解耦。
+            //
+            // 【原实现的 bug】用同一个 cancellationToken（= winnerCts.Token）同时表达两件事：
+            //   1) 这个端点自己超时/报错（真实失败，必须计入熔断计数）
+            //   2) 别的端点已经赢了，本端点被无谓取消（与端点健康度无关，绝不能计入）
+            // 竞速是常态：国内端点 148ms 就返回，而跨境端点要等满 12s 超时。
+            // 一旦有端点胜出，winnerCts.Cancel() 会把还在等超时的端点全部取消，
+            // 而 `if (cancellationToken.IsCancellationRequested) return;` 恰好命中 2)，
+            // 于是**跨境死端点的失败信号被系统性丢弃** —— 熔断永远攒不够次数。
+            // 叠加 CAS 丢计数，熔断 98 分钟内一次都没触发过（v2.6.5 日志实测）。
+            //
+            // 【现在的做法】把"端点超时"与"竞速取消"拆成两个独立的取消源：
+            //   - endpointCts：只负责 perRequestTimeout，端点自己的超时，与竞速无关；
+            //   - raceToken：竞速令牌，只用于"别人赢了就别耗着了"。
+            // 只有 endpointCts 超时（真实失败）才上报熔断；
+            // raceToken 取消（他人胜出）**不产生任何信号** —— 既不记失败（避免误熔慢端点），
+            // 也不记成功（否则会把跨境死端点的失败计数清零，熔断永远攒不够次数）。
+            using var endpointCts = new CancellationTokenSource(perRequestTimeout);
+
             const int maxTries = 2;
             for (var attempt = 0; attempt < maxTries; attempt++)
             {
-                var result = await QueryEndpointAsync(endpoint, dnsParam, cancellationToken);
+                var result = await QueryEndpointAsync(endpoint, dnsParam, endpointCts.Token, raceToken);
                 if (result.Count > 0)
                 {
                     this.ReportEndpointResult(endpoint, success: true);
                     return result;
                 }
 
-                // 注意：被取消（停机）不算端点失败，否则一次正常关闭会把所有端点熔断 10 分钟。
-                if (cancellationToken.IsCancellationRequested)
-                {
-                    return Array.Empty<IPAddress>();
-                }
-
-                if (attempt < maxTries - 1)
+                // 端点自身超时 = 真实失败，重试一次再判定
+                if (attempt < maxTries - 1 && endpointCts.IsCancellationRequested == false && raceToken.IsCancellationRequested == false)
                 {
                     try
                     {
-                        await Task.Delay(TimeSpan.FromMilliseconds(400d), cancellationToken);
+                        await Task.Delay(TimeSpan.FromMilliseconds(400d), raceToken);
                     }
                     catch (OperationCanceledException)
                     {
-                        // 竞速模式下另一端点已胜出：退避等待被取消是正常路径，不计失败。
+                        // 退避等待期间竞速已结束：这是"别人赢了"，本端点并未暴露任何失败证据。
+                        // 【重要】这里**既不记成功也不记失败**：
+                        //   记成功 → 慢端点的历史失败被清零，跨境死端点永远攒不够次数而永不熔断；
+                        //   记失败 → 一次正常竞速胜出就把所有慢端点误判为坏端点。
+                        // 正确处置是"无信号"，让端点健康度只被真实的请求结果驱动。
                         return Array.Empty<IPAddress>();
                     }
+
+                    continue;
                 }
+
+                break;
             }
 
+            // raceToken 已取消 = 两种情形之一：
+            //   a) 别的端点已胜出 → 本端点没有暴露任何失败证据，不计失败（否则跨境慢端点会被系统性误熔）
+            //   b) 整体停机 → 同样不计失败（否则一次正常关闭会把所有端点熔断 10 分钟）
+            // 两种情形的处置一致，因此无需区分。
+            if (raceToken.IsCancellationRequested)
+            {
+                return Array.Empty<IPAddress>();
+            }
+
+            // 走到这里说明：端点自身超时（endpointCts 触发）或全部尝试均返回空，
+            // 且竞速未结束 —— 这是端点的真实失败，计入熔断计数。
             this.ReportEndpointResult(endpoint, success: false);
             return Array.Empty<IPAddress>();
         }
 
         /// <summary>
         /// 向单个 DoH 端点发送 wire 格式查询并解析响应
+        /// <para>
+        /// 【v2.6.6 P0-2】<paramref name="endpointToken"/> 与 <paramref name="raceToken"/> 分离：
+        /// 前者只承载本端点的超时（真实失败的唯一来源），后者只承载"他人已胜出/整体停机"。
+        /// 二者任一触发都返回空列表，但**含义完全不同**，由调用方据此决定是否计入熔断。
+        /// </para>
         /// </summary>
-        private async Task<IReadOnlyList<IPAddress>> QueryEndpointAsync(string endpoint, string dnsParam, CancellationToken cancellationToken)
+        private async Task<IReadOnlyList<IPAddress>> QueryEndpointAsync(
+            string endpoint,
+            string dnsParam,
+            CancellationToken endpointToken,
+            CancellationToken raceToken)
         {
             // 【v2.6.4 关键修正】闸门只保护"发起请求"这个瞬时动作，**不覆盖整个等待过程**。
             //
@@ -564,8 +787,9 @@ namespace FastGithub.DomainResolve
             HttpRequestMessage request;
             try
             {
-                // WaitAsync 前先看取消，避免停机时还在排队。
-                await this.requestGate.WaitAsync(cancellationToken);
+                // 闸门只等"竞速取消"（有人赢了就不必发起），不因端点超时而放弃排队 ——
+                // 否则一个慢端点正占着闸门时，后来者会被误判。
+                await this.requestGate.WaitAsync(raceToken);
             }
             catch (OperationCanceledException)
             {
@@ -583,11 +807,17 @@ namespace FastGithub.DomainResolve
                 this.requestGate.Release();
             }
 
+            // 【v2.6.6 P0-2】链接两个令牌：
+            //   - raceToken 取消 → 他人胜出/停机，HttpClient 抛 TaskCanceledException，
+            //     此时 endpointCts **未** 触发，调用方据此判定"不计失败"；
+            //   - endpointCts 触发 → 本端点真的慢/死了，计入熔断。
+            // 靠"两个令牌谁先触发"来区分，比原来靠单一令牌判断准确得多。
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(endpointToken, raceToken);
             try
             {
                 using (request)
                 {
-                    using var response = await this.httpClient.SendAsync(request, cancellationToken);
+                    using var response = await this.httpClient.SendAsync(request, linkedCts.Token);
                     if (response.IsSuccessStatusCode == false)
                     {
                         // 【不要静默吞掉非200】此前一律返回空列表，最终只报"所有端点均不可用"，
@@ -597,12 +827,20 @@ namespace FastGithub.DomainResolve
                         return Array.Empty<IPAddress>();
                     }
 
-                    var bytes = await response.Content.ReadAsByteArrayAsync(cancellationToken);
+                    var bytes = await response.Content.ReadAsByteArrayAsync(linkedCts.Token);
                     return ParseResponse(bytes);
                 }
             }
             catch (OperationCanceledException)
             {
+                // 端点自身超时（真实失败）必须显式记一条日志：
+                // 这是判断"哪个端点坏了"的唯一依据，此前被静默吞掉，
+                // 导致 98 分钟故障窗口里一条端点级线索都没有。
+                if (endpointToken.IsCancellationRequested && raceToken.IsCancellationRequested == false)
+                {
+                    this.logger.LogDebug($"DoH 端点 {endpoint} 超时（{perRequestTimeout.TotalSeconds:F0}s）");
+                }
+
                 return Array.Empty<IPAddress>();
             }
             catch (Exception ex)

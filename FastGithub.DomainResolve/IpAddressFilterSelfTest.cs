@@ -8,7 +8,7 @@ namespace FastGithub.DomainResolve
     /// IpAddressFilter 自检：确认新增的网段归属过滤能挡住污染段，
     /// 且**不误杀** GitHub / Fastly / Azure 的真实边缘 IP。
     /// </summary>
-    static class IpAddressFilterSelfTest
+    public static class IpAddressFilterSelfTest
     {
         private static int failed;
 
