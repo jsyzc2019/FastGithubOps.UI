@@ -31,6 +31,8 @@ namespace FastGithub.DomainResolve
             TestAdaptiveTimeoutFollowsRtt();
             TestAdaptiveTimeoutClamps();
             TestSuccessKeepsRttHistory();
+            TestCooldownEscalates();
+            TestHalfOpenAllowsOnlyOneProbe();
 
             Console.WriteLine(failed == 0
                 ? "  DohBackoffSelfTest: 全部通过"
@@ -168,12 +170,14 @@ namespace FastGithub.DomainResolve
 
             const string endpoint = "https://8.8.8.8/dns-query";
 
-            // 连续失败 2 次 → 熔断
-            report.Invoke(resolver, new object[] { endpoint, false });
-            report.Invoke(resolver, new object[] { endpoint, false });
+            // 连续失败达到阈值（4 次）→ 熔断
+            for (var i = 0; i < 4; i++)
+            {
+                report.Invoke(resolver, new object[] { endpoint, false });
+            }
 
             var first = GetEndpointState(resolver, endpoint);
-            Assert(first.BlockedUntil > DateTime.UtcNow, "连续失败 2 次后进入熔断");
+            Assert(first.BlockedUntil > DateTime.UtcNow, "连续失败 4 次后进入熔断");
 
             // 熔断期内再失败 10 次，剩余冷却时间不得被拉长
             for (var i = 0; i < 10; i++)
@@ -238,6 +242,23 @@ namespace FastGithub.DomainResolve
 
         private static (int Failures, DateTime BlockedUntil) GetEndpointState(DohResolver resolver, string endpoint)
         {
+            var boxed = GetEndpointStateObject(resolver, endpoint);
+            if (boxed == null)
+            {
+                return (0, DateTime.MinValue);
+            }
+
+            var type = boxed.GetType();
+            var failures = (int)type.GetField("Failures")!.GetValue(boxed)!;
+            var blockedUntil = (DateTime)type.GetField("BlockedUntil")!.GetValue(boxed)!;
+            return (failures, blockedUntil);
+        }
+
+        /// <summary>
+        /// 取出 EndpointState 原对象（需要改动其内部字段时使用）。
+        /// </summary>
+        private static object? GetEndpointStateObject(DohResolver resolver, string endpoint)
+        {
             var field = typeof(DohResolver).GetField("endpointHealth", BindingFlags.NonPublic | BindingFlags.Instance);
             var value = field!.GetValue(resolver)!;
 
@@ -247,19 +268,14 @@ namespace FastGithub.DomainResolve
             {
                 if (dict.Contains(endpoint) == false)
                 {
-                    return (0, DateTime.MinValue);
+                    return null;
                 }
-
-                var boxed = dict[endpoint]!;
-                var type = boxed.GetType();
-                var failures = (int)type.GetField("Failures")!.GetValue(boxed)!;
-                var blockedUntil = (DateTime)type.GetField("BlockedUntil")!.GetValue(boxed)!;
-                return (failures, blockedUntil);
+                return dict[endpoint];
             }
 
             failed++;
             Console.WriteLine("  FAIL endpointHealth 类型不符合预期，无法读取熔断状态");
-            return (0, DateTime.MinValue);
+            return null;
         }
         /// <summary>
         /// 【P1-1】超时必须随端点实测 RTT 自适应。
@@ -408,6 +424,97 @@ namespace FastGithub.DomainResolve
         }
 
         /// <summary>
+        /// 【v2.6.8 回归】熔断冷却必须**递增**，且在 30 分钟封顶。
+        /// <para>
+        /// v2.6.7 实测的 DoH 死循环（日志 publish/v267/logs/log20261004.txt）：
+        /// 5 个端点在启动后 25 秒内全部熔断，之后每 10 分钟整批重熔断一次 ——
+        /// 15:59 / 16:10 / 16:20 / 16:31 / 16:41 / 16:51，节奏精确等于固定冷却时长。
+        /// 原因是"固定 10 分钟 + 阈值 2"：冷却一过，积压的 40 个查询（20 域名 × A/AAAA）
+        /// 同时打向 5 个端点形成 200 并发，端点排队限速 → 又连续失败 2 次 → 立即二次熔断。
+        /// 递增冷却让偶发抖动只短暂休息，而真正不可达的端点（跨境 1.1.1.1/8.8.8.8）
+        /// 会逐次加长，最终稳定在 30 分钟，不会每 2 分钟被唤醒一次。
+        /// </para>
+        /// </summary>
+        private static void TestCooldownEscalates()
+        {
+            Console.WriteLine("熔断冷却递增并封顶");
+            var method = StaticMethod("ComputeCooldown");
+            Assert(method != null, "ComputeCooldown 方法存在");
+            if (method == null) return;
+
+            var expected = new[] { 2d, 4d, 8d, 16d, 30d, 30d, 30d };
+            for (var i = 0; i < expected.Length; i++)
+            {
+                var actual = Invoke<TimeSpan>(method, i + 1);
+                Assert(
+                    Math.Abs(actual.TotalMinutes - expected[i]) < 0.001,
+                    $"第 {i + 1} 次连续熔断冷却 = {expected[i]:F0} 分钟",
+                    $"实际 {actual.TotalMinutes:F1} 分钟");
+            }
+        }
+
+        /// <summary>
+        /// 【v2.6.8 回归】半开探测：冷却到期后**只允许一个**请求进入。
+        /// <para>
+        /// 这是打断熔断死循环的关键一环。若冷却一过就全部放行，
+        /// 20 个域名 × 2 记录类型会同时涌向端点把它重新打爆，
+        /// 于是熔断-洪峰-再熔断无限循环（v2.6.7 实测每 10 分钟一轮）。
+        /// 半开让"恢复"只需 1 个请求即可确认，代价从 40 个请求的洪峰降到 1 个。
+        /// </para>
+        /// </summary>
+        private static void TestHalfOpenAllowsOnlyOneProbe()
+        {
+            Console.WriteLine("半开探测只放行一个请求");
+            var resolver = CreateResolver();
+            var report = InstanceMethod("ReportEndpointResult");
+            var isBlocked = InstanceMethod("IsEndpointBlocked");
+            Assert(report != null && isBlocked != null, "反射目标存在");
+            if (report == null || isBlocked == null) return;
+
+            const string endpoint = "https://223.5.5.5/dns-query";
+
+            // 连续失败达到阈值（4 次）→ 熔断
+            for (var i = 0; i < 4; i++)
+            {
+                report.Invoke(resolver, new object[] { endpoint, false });
+            }
+
+            var (failures, blockedUntil) = GetEndpointState(resolver, endpoint);
+            Assert(blockedUntil > DateTime.UtcNow, "连续失败 4 次后进入熔断");
+            Assert((bool)isBlocked.Invoke(resolver, new object[] { endpoint })!, "熔断期内被跳过");
+
+            // 把冷却时刻改到过去，模拟"冷却已到期"。
+            // 注意 EndpointState 是 private 嵌套类，此处只能经反射改字段，
+            // 无法直接 lock(state.SyncRoot)（拿到的静态类型是 object，lock 要求引用类型）。
+            // 单线程自测下无并发竞争，不需要额外加锁。
+            var state = GetEndpointStateObject(resolver, endpoint);
+            if (state == null)
+            {
+                return;
+            }
+
+            var stateType = state.GetType();
+            stateType.GetField("BlockedUntil")!.SetValue(state, DateTime.UtcNow.AddSeconds(-1d));
+
+            // 冷却到期：第一个调用方应被放行（半开试探）
+            var first = (bool)isBlocked.Invoke(resolver, new object[] { endpoint })!;
+            Assert(first == false, "冷却到期后第一个请求被放行（半开试探）");
+
+            // 第二个及以后的调用方必须被挡住 —— 这正是防洪峰的关键
+            var second = (bool)isBlocked.Invoke(resolver, new object[] { endpoint })!;
+            Assert(second, "半开期间第二个请求被挡住（避免并发洪峰）");
+
+            // 试探成功 → 端点完全恢复，后续请求全部正常放行
+            report.Invoke(resolver, new object[] { endpoint, true });
+            Assert((bool)isBlocked.Invoke(resolver, new object[] { endpoint })! == false,
+                "半开试探成功后端点恢复正常放行");
+            Assert((bool)isBlocked.Invoke(resolver, new object[] { endpoint })! == false,
+                "恢复后第二个请求同样正常放行（半开标记已清除）");
+            Assert(GetEndpointState(resolver, endpoint).Failures == 0,
+                "恢复后失败计数清零");
+        }
+
+        /// <summary>
         /// 构造一个不写盘的 DohResolver（写盘会污染工作目录）
         /// </summary>
         private static DohResolver CreateResolver()
@@ -417,7 +524,6 @@ namespace FastGithub.DomainResolve
             var ctor = typeof(DohResolver).GetConstructors()[0];
             return (DohResolver)ctor.Invoke(new object?[] { logger })!;
         }
-
         private static void Assert(bool condition, string title, string? detail = null)        {
             if (condition)
             {

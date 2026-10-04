@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -268,11 +269,57 @@ namespace FastGithub.Http
             using var totalTimeoutSource = new CancellationTokenSource(totalConnectBudget);
             using var totalTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, totalTimeoutSource.Token);
 
-            foreach (var ipEndPoint in candidates.Take(MAX_TRY_COUNT))
+            // 【v2.6.8 P0 关键修复】单候选预算必须从"剩余总预算"里切，不能各用 ConnectBudget。
+            //
+            // 【v2.6.7 实测故障（日志 publish/v267/logs/log20261004.txt，4 次 ERR 全部同款）】
+            //   System.TimeoutException: 在 10s 内未能连接 github.com（已尝试 0 个候选IP）
+            //
+            // 【根因：两个常数互相矛盾，MAX_TRY_COUNT=3 对 github.com 是死代码】
+            //   appsettings.github.json  github.com.ConnectTimeout = 12s
+            //   本文件                   totalConnectBudget     = 10s   <-- 比单候选还小
+            // 第一个候选的 linkedToken 里同时挂着 12s 与 10s 两个令牌，**10s 那个先到**，
+            // 于是第一个候选耗尽总预算 → 进入 `totalTimeoutSource.IsCancellationRequested`
+            // 分支直接 `break`，候选 2、3 一次都没试过。
+            // 更糟的是该分支的报错文案取 `innerExceptions.Count`，
+            // 而此刻还没往里 Add 过任何异常 → 恒为 0 → 报"已尝试 0 个候选IP"。
+            // 用户看到这句话会误判为"解析层一个 IP 都没给出"，而真实情况是
+            // **解析层给了 1~3 个候选、是第一个候选吃掉了全部预算**。
+            // 这条误报文案已实测出现在 4 条用户可见的 502 上。
+            //
+            // 【正确做法：按剩余时间与剩余候选数动态等分】
+            //   本候选预算 = min(ConnectBudget, 剩余总预算 / 剩余候选数)
+            // 这样 3 个候选共享 10s，每个约 3.3s；而 github.com 单 IP 实测健康耗时
+            // 仅 0.4~1.1s，3.3s 足够完成 TCP+TLS，于是三个候选都能真正参与竞争。
+            // 若只有 1 个候选，它独享全部 10s（等价于原来的行为）。
+            // 反之若某域名配了 ConnectTimeout=25s（usercontent），切片后每个候选
+            // 仍能拿到 3.3s，不会因为配置的 25s 而挤掉后续候选。
+            var tryList = candidates.Take(MAX_TRY_COUNT).ToArray();
+            var totalBudgetStartedAt = Stopwatch.GetTimestamp();
+
+            for (var index = 0; index < tryList.Length; index++)
             {
+                var ipEndPoint = tryList[index];
+                var remainingCandidates = tryList.Length - index;
+
+                // 剩余总预算 = 总预算 - 已消耗。已耗尽则不再发起新的连接尝试。
+                var elapsed = Stopwatch.GetElapsedTime(totalBudgetStartedAt);
+                var remainingBudget = totalConnectBudget - elapsed;
+                if (remainingBudget <= TimeSpan.Zero)
+                {
+                    innerExceptions.Add(new TimeoutException(
+                        $"在 {totalConnectBudget.TotalSeconds:F0}s 内未能连接 {context.DnsEndPoint.Host}（已尝试 {index} 个候选IP）"));
+                    this.logger?.LogWarning($"{context.DnsEndPoint.Host} 建连总预算耗尽，放弃剩余候选并触发IP更新");
+                    break;
+                }
+
+                // 本候选的预算：不超过配置值，但也不允许超过"剩余预算/剩余候选数"，
+                // 否则又会出现"第一个候选独吞全部预算、后续候选没机会"的原故障。
+                var slice = remainingBudget / remainingCandidates;
+                var budget = this.ConnectBudget < slice ? this.ConnectBudget : slice;
+
                 try
                 {
-                    using var timeoutTokenSource = new CancellationTokenSource(this.ConnectBudget);
+                    using var timeoutTokenSource = new CancellationTokenSource(budget);
                     using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(timeoutTokenSource.Token, totalTokenSource.Token);
                     var (stream, verified) = await this.ConnectAsync(context, ipEndPoint, linkedTokenSource.Token);
 
@@ -291,14 +338,19 @@ namespace FastGithub.Http
 
                     // 总预算耗尽：说明这批候选整体不可用（或网络极慢），立即停止逐个试，
                     // 交给下面的"找不到可用IP → 触发刷新 + 重试"路径尽快恢复。
+                    // 注意用 index+1 而非 innerExceptions.Count —— 后者在本分支里
+                    // 尚未 Add 当前候选，报错会恒显示"已尝试 0 个"，掩盖真实尝试次数。
                     if (totalTimeoutSource.IsCancellationRequested)
                     {
                         innerExceptions.Add(new TimeoutException(
-                            $"在 {totalConnectBudget.TotalSeconds:F0}s 内未能连接 {context.DnsEndPoint.Host}（已尝试 {innerExceptions.Count} 个候选IP）"));
-                        this.logger?.LogWarning($"{context.DnsEndPoint.Host} 建连总预算耗尽，放弃剩余候选并触发IP更新");
+                            $"在 {totalConnectBudget.TotalSeconds:F0}s 内未能连接 {context.DnsEndPoint.Host}（已尝试 {index + 1} 个候选IP）"));
+                        this.logger?.LogWarning(
+                            $"{context.DnsEndPoint.Host} 建连总预算耗尽（已尝试 {index + 1}/{tryList.Length} 个候选IP），放弃剩余候选并触发IP更新");
                         break;
                     }
 
+                    // 本候选的独立预算用尽（总预算尚有余量）：这是**该 IP 自身**的失败证据，
+                    // 必须上报，否则坏 IP 会一直留在候选列表首位被反复优先尝试。
                     this.domainResolver.ReportFailure(context.DnsEndPoint, ipEndPoint.Address);
                     innerExceptions.Add(new HttpConnectTimeoutException(ipEndPoint.Address));
                 }

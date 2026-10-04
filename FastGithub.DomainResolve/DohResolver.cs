@@ -71,13 +71,48 @@ namespace FastGithub.DomainResolve
         /// 熔断后失效端点会被跳过，只保留真正可达的端点，
         /// 解析耗时回落到"最快可达端点"的量级，且**不增加任何额外请求流量**。
         /// </para>
+        /// <para>
+        /// 【v2.6.8 修正 2 → 4】原值 2 太激进，且与"冷却结束瞬间的并发洪峰"形成死循环。
+        /// v2.6.7 实测日志给出完整证据（publish/v267/logs/log20261004.txt）：
+        /// <code>
+        /// 15:59:23 阿里 223.5.5.5 熔断（启动后仅 14 秒）
+        /// 15:59:24 doh.pub 熔断
+        /// 15:59:25 doh.360.cn 熔断
+        /// ...此后每 10 分钟整 5 个端点同时重熔断一次：
+        /// 16:10:25 / 16:20:35 / 16:31:14 / 16:41:37 / 16:51:50
+        /// </code>
+        /// 即**熔断从未真正让端点休息过**：10 分钟冷却一过，积压的
+        /// "20 域名 × 2 记录类型 = 40 个查询"在同一瞬间全部涌向 5 个端点（200 请求），
+        /// 端点侧排队/限速 → 又是连续 2 次失败 → 立刻二次熔断。
+        /// 阈值 2 意味着任何端点只要有 2 次抖动就被判死 10 分钟，
+        /// 而"能撑过 10 分钟的端点"根本不存在，因为恢复窗口永远被洪峰填满。
+        /// 提高到 4 后，单次网络抖动不再触发熔断；配合下方递增冷却与半开探测，
+        /// 端点能真正获得喘息窗口。
+        /// </para>
         /// </summary>
-        private const int endpointFailureThreshold = 2;
+        private const int endpointFailureThreshold = 4;
 
         /// <summary>
-        /// 熔断后的冷却时长：给被墙端点恢复的机会，同时不至于让一次网络抖动就长期弃用端点。
+        /// 熔断后的**首次**冷却时长。
+        /// <para>
+        /// 【v2.6.8】由固定 10 分钟改为"首次 2 分钟 + 每次熔断递增"（见 <see cref="endpointCooldownMax"/>）。
+        /// 固定 10 分钟的问题不只是长，更是**与恢复洪峰叠加**：
+        /// 20 个域名的失败退避（上限 60s）在冷却期内早已全部到期，
+        /// 冷却一结束就集体重试，把端点再次打爆 → 二次熔断 10 分钟 → 无限循环。
+        /// 短冷却 + 递增能快速淘汰真正的死端点，同时给可恢复端点留出真实窗口。
+        /// </para>
         /// </summary>
-        private static readonly TimeSpan endpointCooldown = TimeSpan.FromMinutes(10d);
+        private static readonly TimeSpan endpointCooldown = TimeSpan.FromMinutes(2d);
+
+        /// <summary>
+        /// 熔断冷却的上限：连续熔断超过 4 次后按此封顶（2→4→8→16→30→30... 分钟）。
+        /// <para>
+        /// 递增的意义：偶发抖动只短暂休息（2 分钟即可回到正常），
+        /// 而对**确实不可达**的端点（跨境 1.1.1.1/8.8.8.8）会逐次加长，
+        /// 避免它们每 2 分钟就被唤醒一次、白耗一次完整超时预算。
+        /// </para>
+        /// </summary>
+        private static readonly TimeSpan endpointCooldownMax = TimeSpan.FromMinutes(30d);
 
         /// <summary>
         /// 【v2.6.6 P0-1】解析失败后的退避基数（首次失败后等这么久才允许再试）。
@@ -216,7 +251,24 @@ namespace FastGithub.DomainResolve
             public DateTime BlockedUntil = DateTime.MinValue;
 
             /// <summary>
-            /// 【v2.6.6 P1-1】该端点的 RTT 指数滑动平均（毫秒），0 表示尚无成功样本。
+            /// 【v2.6.8】已连续熔断的次数，用于计算递增冷却。
+            /// <para>成功一次即清零：端点恢复说明此前的失败是偶发，不该继承历史惩罚。</para>
+            /// </summary>
+            public int ConsecutiveBlocks;
+
+            /// <summary>
+            /// 【v2.6.8】半开探测标记：冷却已到期、正在放行"试探性请求"。
+            /// <para>
+            /// 死循环的最后一环在此：冷却一过，积压的 40 个域名查询同时涌向端点。
+            /// 半开态让**同一时刻只有一个请求**被放行试探，其余等待其结果——
+            /// 端点若真恢复了，用 1 个请求就足以确认（几十毫秒）；
+            /// 若仍不可达，也只浪费 1 个请求的预算，而不是 40 个一起把端点再打爆一次。
+            /// </para>
+            /// </summary>
+            public bool HalfOpen;
+
+            /// <summary>
+            /// 【v2.6.8 RTT 指数滑动平均（毫秒），0 表示尚无成功样本。
             /// <para>用于按端点实际快慢动态计算超时，而非全局固定值。</para>
             /// </summary>
             public double RttEma;
@@ -343,7 +395,12 @@ namespace FastGithub.DomainResolve
                             this.endpointHealth[endpoint] = new EndpointState
                             {
                                 Failures = endpointFailureThreshold,
-                                BlockedUntil = until
+
+                                // 【v2.6.8】继承时按"已熔断过至少一次"处理，
+                                // 使重启后的首次失败走递增而非从 2 分钟重新开始，
+                                // 避免"重启一次就刷新一次惩罚"的隐式重置。
+                                BlockedUntil = until,
+                                ConsecutiveBlocks = 1
                             };
                         }
                     }
@@ -644,7 +701,27 @@ namespace FastGithub.DomainResolve
         }
 
         /// <summary>
-        /// 该端点是否处于熔断冷却期
+        /// 该端点是否处于熔断冷却期（或半开试探尚未放行）。
+        /// <para>
+        /// 【v2.6.8 关键修复：半开探测，打断"冷却—洪峰—再熔断"死循环】
+        /// v2.6.7 实测日志（publish/v267/logs/log20261004.txt）显示 5 个端点每 10 分钟
+        /// 集体重熔断一次，熔断因此完全失效 —— DoH 在整整 1 小时里只有 63 次成功、
+        /// 97 次失败，用户请求被拖到"在 10s 内未能连接 github.com（已尝试 0 个候选IP）"。
+        /// <para>
+        /// 机制：冷却 10 分钟到期 → <c>IsEndpointBlocked</c> 清零计数并全部放行 →
+        /// 40 个积压查询（20 域名 × A/AAAA）同时打向 5 个端点 = 200 并发 →
+        /// 端点排队/限速 → 再连续失败 2 次 → 立刻二次熔断 10 分钟。
+        /// 积压的来源是失败退避（上限 60s）在 10 分钟冷却里早已全部到期，
+        /// 所以恢复窗口**必然**被洪峰填满 —— 这是结构性的，不是偶发。
+        /// <para>
+        /// 现在改为标准的"冷却 → 半开 → 关闭"三态：
+        ///   冷却中：直接跳过（不变）；
+        ///   冷却到期：进入<strong>半开</strong>，同一时刻只放行**一个**试探请求，
+        ///            其余调用方一律跳过并等待该请求的结果；
+        ///   试探成功：端点恢复为完全可用（清空半开与全部计数）；
+        ///   试探失败：按递增冷却重新熔断（2→4→8→16→30 分钟封顶）。
+        /// 端点真恢复时，1 个请求（百毫秒级）即可确认，代价远小于 40 个请求的洪峰。
+        /// </para>
         /// </summary>
         private bool IsEndpointBlocked(string endpoint)
         {
@@ -660,13 +737,20 @@ namespace FastGithub.DomainResolve
                     return true;
                 }
 
-                // 冷却已过，给一次重新试探的机会（清零失败计数）
+                // 冷却已过。此前若有失败计数或熔断记录，走半开试探：
+                // 只让第一个调用方进去，其余返回 true（本轮不发请求）。
                 if (state.Failures > 0 || state.BlockedUntil != DateTime.MinValue)
                 {
-                    state.Failures = 0;
-                    state.BlockedUntil = DateTime.MinValue;
+                    if (state.HalfOpen)
+                    {
+                        return true;
+                    }
+
+                    state.HalfOpen = true;
+                    return false;
                 }
 
+                // 从未失败过（或已成功恢复）：正常放行
                 return false;
             }
         }
@@ -685,6 +769,10 @@ namespace FastGithub.DomainResolve
         /// 于是每次成功都会把 RTT 历史一起抹掉 → 下次 GetTimeoutFor 又退回
         /// "无样本" 的 12s 上界，**自适应完全失效**（恰好在端点最健康、最该快的时候失效）。
         /// </para>
+        /// <para>
+        /// 【v2.6.8】新增：递增冷却（连续熔断逐次加倍，30 分钟封顶）+ 半开探测结果收敛。
+        /// 熔断时长按 <see cref="ComputeCooldown"/> 计算，取代原先"每次都固定 10 分钟"。
+        /// </para>
         /// </summary>
         private void ReportEndpointResult(string endpoint, bool success)
         {
@@ -699,6 +787,11 @@ namespace FastGithub.DomainResolve
                     shouldPersist = state.BlockedUntil > DateTime.UtcNow || state.Failures > 0;
                     state.Failures = 0;
                     state.BlockedUntil = DateTime.MinValue;
+
+                    // 成功即视为完全恢复：清空递增惩罚与半开标记。
+                    // 端点既然回来了，继续背着 16 分钟冷却只会让它白白被跳过。
+                    state.ConsecutiveBlocks = 0;
+                    state.HalfOpen = false;
                 }
 
                 if (shouldPersist)
@@ -710,8 +803,15 @@ namespace FastGithub.DomainResolve
             }
 
             var newlyBlocked = false;
+            var cooldown = TimeSpan.Zero;
             lock (state.SyncRoot)
             {
+                // 半开试探已结束（无论成败），清标记：失败会立刻重新进入熔断并置 HalfOpen=false，
+                // 成功已在上方返回。若走到这里既没重新熔断也没成功，
+                // 说明是竞速取消（无信号）路径，不该让端点卡在半开态把后续请求全部挡在门外。
+                var wasHalfOpen = state.HalfOpen;
+                state.HalfOpen = false;
+
                 if (state.BlockedUntil > DateTime.UtcNow)
                 {
                     // 已在冷却中，保持原有的剩余时长，不要被本次失败无限延长
@@ -721,7 +821,16 @@ namespace FastGithub.DomainResolve
                 state.Failures++;
                 if (state.Failures >= endpointFailureThreshold)
                 {
-                    state.BlockedUntil = DateTime.UtcNow.Add(endpointCooldown);
+                    // 递增冷却：连续熔断次数决定本次时长（2→4→8→16→30 封顶）
+                    cooldown = ComputeCooldown(++state.ConsecutiveBlocks);
+                    state.BlockedUntil = DateTime.UtcNow.Add(cooldown);
+
+                    // 明确记下这是第几次半开试探失败，便于诊断端点是否真的死了
+                    if (wasHalfOpen)
+                    {
+                        this.logger.LogDebug($"DoH 端点 {endpoint} 半开试探失败，重新熔断 {cooldown.TotalMinutes:F0} 分钟");
+                    }
+
                     newlyBlocked = true;
                 }
             }
@@ -730,8 +839,25 @@ namespace FastGithub.DomainResolve
             if (newlyBlocked)
             {
                 this.PersistEndpointHealth();
-                this.logger.LogWarning($"DoH 端点 {endpoint} 连续失败 {endpointFailureThreshold} 次，已熔断 {endpointCooldown.TotalMinutes:F0} 分钟");
+                this.logger.LogWarning(
+                    $"DoH 端点 {endpoint} 连续失败 {endpointFailureThreshold} 次，已熔断 {cooldown.TotalMinutes:F0} 分钟");
             }
+        }
+
+        /// <summary>
+        /// 计算第 n 次连续熔断的冷却时长（2→4→8→16→30 封顶）。
+        /// <para>
+        /// 用位移而非 <c>Math.Pow</c>：与 <see cref="ComputeBackoff"/> 保持同一实现风格，
+        /// 避免浮点误差导致同样次数算出不同秒数。
+        /// </para>
+        /// </summary>
+        private static TimeSpan ComputeCooldown(int consecutiveBlocks)
+        {
+            var shift = Math.Min(consecutiveBlocks - 1, 20);
+            var seconds = endpointCooldown.TotalSeconds * (1 << shift);
+            return seconds >= endpointCooldownMax.TotalSeconds
+                ? endpointCooldownMax
+                : TimeSpan.FromSeconds(seconds);
         }
 
         /// <summary>
