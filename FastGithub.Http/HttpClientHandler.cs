@@ -51,7 +51,15 @@ namespace FastGithub.Http
         // 这里给整个"找一个可用 IP"的过程封顶，超时即立刻放弃并走刷新逻辑，
         // 让失败快速暴露、尽快进入下一轮重试，而不是在一个注定失败的请求上死等。
         /// </para>
-        private static readonly TimeSpan totalConnectBudget = TimeSpan.FromSeconds(20d);
+        // <para>
+        // 【为何从 20s 下调到 10s】原值 20s 仍偏大：本机实测不可路由地址的 TCP SYN
+        // 重传约需 21s，因此单IP 预算（12s）往往先于总预算耗尽，总预算实际只起到
+        // "兜底"作用；而失败请求的总等待 = 总预算 + 后续处理，很容易冲到数十秒。
+        // 结合实测健康 IP 的 TCP+TLS 耗时仅 0.4~1.1s（跨境 RTT 正常时），
+        /// 10s 足以让任一健康候选完成建连，同时把"一个都连不上"的最坏情况
+        // 从最坏 36s 压到 10s 以内——失败要快速暴露，才能尽快进入下一轮恢复。
+        /// </para>
+        private static readonly TimeSpan totalConnectBudget = TimeSpan.FromSeconds(10d);
 
         // 刷新闸门按域名隔离。
         // 原实现是一个全局 static 令牌，任意域名触发刷新会让其他域名
@@ -96,6 +104,19 @@ namespace FastGithub.Http
             request.RequestUri = new UriBuilder(uri) { Scheme = Uri.UriSchemeHttp }.Uri;
 
             // 整体请求预算（建连+传输+下载），按域名可覆盖；未设置则不限制单请求总时长。
+            // <para>
+            // 【为什么必须恢复这一层】v2.5.5 为避免"慢 IP 被误杀"把各域名的 Timeout 全部移除，
+            // 只保留 ConnectTimeout。副作用是失败请求失去整体上限：不可路由的 IP 会走完
+            // TCP SYN 重传（本机实测约 21s），串行候选再叠加负载，最慢一条达到 99.5s
+            // （日志实测慢 502 的 p50=51s、max=99.5s），YARP 把它映射成 502 返回，
+            // 用户观感是"网页卡死一分多钟"。
+            // </para>
+            // <para>
+            // 注意：这里的 Timeout 不是 HttpClient.Timeout——本项目的转发客户端
+            // FastGithub.Http.HttpClient 继承 HttpMessageInvoker，本身没有 Timeout 属性，
+            // 也不经过 IHttpClientFactory。该预算是转发链路上唯一有效的整体上限，
+            // 因此配置时不能省略。
+            // </para>
             CancellationToken effectiveToken = cancellationToken;
             using var timeoutTokenSource = this.domainConfig.Timeout != null
                 ? new CancellationTokenSource(this.domainConfig.Timeout.Value)

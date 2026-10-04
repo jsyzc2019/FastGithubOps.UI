@@ -188,7 +188,15 @@ namespace FastGithub.HttpServer.Certs
         /// <returns></returns>
         private static IEnumerable<string> GetExtraDomains()
         {
-            yield return Environment.MachineName;
+            // Environment.MachineName 在部分环境（改名后未重启、克隆/容器）可能为空字符串，
+            // 把它塞进 SAN 会让证书生成抛 ArgumentOutOfRangeException。这里先过滤，
+            // 避免把无效值带到证书生成流程。
+            var machineName = Environment.MachineName;
+            if (string.IsNullOrWhiteSpace(machineName) == false)
+            {
+                yield return machineName;
+            }
+
             yield return IPAddress.Loopback.ToString();
             yield return IPAddress.IPv6Loopback.ToString();
         }

@@ -44,7 +44,7 @@ namespace FastGithub.HttpServer.Certs
             request.CertificateExtensions.Add(enhancedKeyUsage);
 
             var dnsBuilder = new SubjectAlternativeNameBuilder();
-            dnsBuilder.Add(subjectName.Name[3..]);
+            dnsBuilder.AddCommonName(subjectName);
             request.CertificateExtensions.Add(dnsBuilder.Build());
 
             var subjectKeyId = new X509SubjectKeyIdentifierExtension(request.PublicKey, false);
@@ -91,7 +91,7 @@ namespace FastGithub.HttpServer.Certs
             request.CertificateExtensions.Add(subjectKeyId);
 
             var dnsBuilder = new SubjectAlternativeNameBuilder();
-            dnsBuilder.Add(subjectName.Name[3..]);
+            dnsBuilder.AddCommonName(subjectName);
 
             if (extraDnsNames != null)
             {
@@ -121,8 +121,41 @@ namespace FastGithub.HttpServer.Certs
 
 
 
+        private static void AddCommonName(this SubjectAlternativeNameBuilder builder, X500DistinguishedName subjectName)
+        {
+            // 证书主题形如 "CN=xxx"，需去掉 "CN=" 前缀后作为 SAN。
+            // 原实现直接 subjectName.Name[3..]，隐含假设名称至少 3 个字符；
+            // 若名称为空或过短（改名、克隆、容器环境等），会抛
+            // ArgumentOutOfRangeException。改为先剥离前缀、再判空。
+            var name = subjectName.Name;
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return;
+            }
+
+            const string cnPrefix = "CN=";
+            if (name.StartsWith(cnPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                name = name[cnPrefix.Length..];
+            }
+
+            builder.Add(name);
+        }
+
         private static void Add(this SubjectAlternativeNameBuilder builder, string name)
         {
+            // 【必须判空】SubjectAlternativeNameBuilder.AddDnsName 对空串/空白串直接抛
+            // ArgumentOutOfRangeException("dnsName")。本方法由证书生成调用链
+            // （CertService.GetExtraDomains -> CreateEndCertificate -> Kestrel 的
+            // ServerOptionsCallback）触发，且 Kestrel 侧未捕获该异常：
+            // 任何一个不带 SNI 的 TLS 连接都会让异常逃逸并中断该连接，
+            // 日志中已实测到 3 次 "String cannot be empty or null. (Parameter 'dnsName')"。
+            // 空值对SAN 也没有任何意义，直接跳过即可。
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return;
+            }
+
             if (IPAddress.TryParse(name, out var address))
             {
                 builder.AddIpAddress(address);
