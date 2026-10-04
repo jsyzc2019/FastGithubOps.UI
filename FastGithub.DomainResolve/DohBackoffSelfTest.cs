@@ -28,6 +28,9 @@ namespace FastGithub.DomainResolve
             TestEndpointFailureCounterIsAtomicUnderConcurrency();
             TestCooldownPersistsAcrossProcess();
             TestSuccessClearsNegativeCache();
+            TestAdaptiveTimeoutFollowsRtt();
+            TestAdaptiveTimeoutClamps();
+            TestSuccessKeepsRttHistory();
 
             Console.WriteLine(failed == 0
                 ? "  DohBackoffSelfTest: 全部通过"
@@ -258,6 +261,152 @@ namespace FastGithub.DomainResolve
             Console.WriteLine("  FAIL endpointHealth 类型不符合预期，无法读取熔断状态");
             return (0, DateTime.MinValue);
         }
+        /// <summary>
+        /// 【P1-1】超时必须随端点实测 RTT 自适应。
+        /// <para>
+        /// 若超时恒为固定 12s，则 v2.6.5 日志里"RTT 6 小时劣化一个数量级"这件事
+        /// 无论把常数调成多少都会失配：调小误杀慢端点并触发熔断，调大让死端点拖满预算。
+        /// 自适应的判据是：同一端点在 RTT 变大后，预算必须**跟着变大**。
+        /// </para>
+        /// </summary>
+        private static void TestAdaptiveTimeoutFollowsRtt()
+        {
+            Console.WriteLine("自适应超时随实测 RTT 变化");
+            var resolver = CreateResolver();
+            const string endpoint = "https://223.5.5.5/dns-query";
+
+            var getTimeout = InstanceMethod("GetTimeoutFor");
+            var reportRtt = InstanceMethod("ReportEndpointRtt");
+            Assert(getTimeout != null, "GetTimeoutFor 方法存在");
+            Assert(reportRtt != null, "ReportEndpointRtt 方法存在");
+            if (getTimeout == null || reportRtt == null)
+            {
+                return;
+            }
+
+            // 首次访问：无历史样本，必须给上界（不因"还不知道多快"而先斩断机会）
+            var first = (TimeSpan)getTimeout.Invoke(resolver, new object[] { endpoint })!;
+            Assert(first == TimeSpan.FromSeconds(12d),
+                "无 RTT 样本时退到上界 12s（不预先判死）",
+                $"实际 {first.TotalSeconds:F1}s");
+
+            // 快端点：RTT 150ms -> 3x = 450ms，但被下界 3s 夹住
+            reportRtt.Invoke(resolver, new object[] { endpoint, 150d });
+            var fast = (TimeSpan)getTimeout.Invoke(resolver, new object[] { endpoint })!;
+            Assert(fast == TimeSpan.FromSeconds(3d),
+                "RTT 150ms 的快端点被夹到下界 3s（远快于固定 12s，失败能更早暴露）",
+                $"实际 {fast.TotalSeconds:F1}s");
+
+            // 慢端点：RTT 劣化到 2500ms -> 3x = 7.5s
+            // 连续上报让 EMA 收敛过去（EMA 权重 0.3，需多次）
+            for (var i = 0; i < 12; i++)
+            {
+                reportRtt.Invoke(resolver, new object[] { endpoint, 2500d });
+            }
+            var slow = (TimeSpan)getTimeout.Invoke(resolver, new object[] { endpoint })!;
+            Assert(slow > fast,
+                "RTT 劣化后预算跟着变大（慢端点不再被秒级预算误判为死）",
+                $"{fast.TotalSeconds:F1}s -> {slow.TotalSeconds:F1}s");
+            Assert(slow <= TimeSpan.FromSeconds(12d),
+                "劣化后预算不超过上界 12s",
+                $"实际 {slow.TotalSeconds:F1}s");
+
+            // 两个端点互不干扰 —— 这正是"自适应"相对"调大固定值"的核心价值
+            const string fastEndpoint = "https://doh.pub/dns-query";
+            for (var i = 0; i < 12; i++)
+            {
+                reportRtt.Invoke(resolver, new object[] { fastEndpoint, 160d });
+            }
+            var other = (TimeSpan)getTimeout.Invoke(resolver, new object[] { fastEndpoint })!;
+            Assert(other == TimeSpan.FromSeconds(3d),
+                "慢端点劣化不会牵连快端点（各自独立预算）",
+                $"实际 {other.TotalSeconds:F1}s");
+        }
+
+        /// <summary>
+        /// 【P1-1】上界必须夹紧：RTT 再离谱也不能超过 12s，
+        /// 否则一个端点就能顶穿交互域名的 25s 整体预算。
+        /// </summary>
+        private static void TestAdaptiveTimeoutClamps()
+        {
+            Console.WriteLine("自适应超时上下界夹紧");
+            var resolver = CreateResolver();
+            const string endpoint = "https://1.1.1.1/dns-query";
+            var reportRtt = InstanceMethod("ReportEndpointRtt");
+            var getTimeout = InstanceMethod("GetTimeoutFor");
+            if (reportRtt == null || getTimeout == null)
+            {
+                failed++;
+                Console.WriteLine("  FAIL 反射目标不存在");
+                return;
+            }
+
+            // 荒谬的 RTT（60s）也不得突破上界
+            reportRtt.Invoke(resolver, new object[] { endpoint, 60_000d });
+            var clamped = (TimeSpan)getTimeout.Invoke(resolver, new object[] { endpoint })!;
+            Assert(clamped == TimeSpan.FromSeconds(12d),
+                "极端 RTT 被上界夹紧到 12s（防止顶穿 25s 整体预算）",
+                $"实际 {clamped.TotalSeconds:F1}s");
+
+            // 极快 RTT（10ms）不得跌破下界
+            const string fast2 = "https://doh.360.cn/dns-query";
+            reportRtt.Invoke(resolver, new object[] { fast2, 10d });
+            var clampedLow = (TimeSpan)getTimeout.Invoke(resolver, new object[] { fast2 })!;
+            Assert(clampedLow == TimeSpan.FromSeconds(3d),
+                "极快 RTT 被下界夹紧到 3s（留足抖动余量，不会被瞬时快样本压到过短）",
+                $"实际 {clampedLow.TotalSeconds:F1}s");
+        }
+
+        /// <summary>
+        /// 【P1-1】上报成功**不得**清掉 RTT 历史。
+        /// <para>
+        /// 这是一条真实踩过的坑：端点状态同时承担熔断与 RTT 两个职责，
+        /// 成功路径若整条TryRemove，RTT 历史随之消失 → 超时预算每次都退回 12s 上界，
+        /// 自适应等于完全失效，且恰好发生在端点最健康的时刻，最难察觉。
+        /// </para>
+        /// </summary>
+        private static void TestSuccessKeepsRttHistory()
+        {
+            Console.WriteLine("上报成功保留 RTT 历史");
+            var resolver = CreateResolver();
+            const string endpoint = "https://223.5.5.5/dns-query";
+            var reportRtt = InstanceMethod("ReportEndpointRtt");
+            var reportResult = InstanceMethod("ReportEndpointResult");
+            var getTimeout = InstanceMethod("GetTimeoutFor");
+            if (reportRtt == null || reportResult == null || getTimeout == null)
+            {
+                failed++;
+                Console.WriteLine("  FAIL 反射目标不存在");
+                return;
+            }
+
+            // 先建立一个"慢端点"的 RTT 历史
+            for (var i = 0; i < 12; i++)
+            {
+                reportRtt.Invoke(resolver, new object[] { endpoint, 2500d });
+            }
+            var before = (TimeSpan)getTimeout.Invoke(resolver, new object[] { endpoint })!;
+
+            // 上报成功（这是每轮竞速赢家的必经路径）
+            reportResult.Invoke(resolver, new object[] { endpoint, true });
+            var after = (TimeSpan)getTimeout.Invoke(resolver, new object[] { endpoint })!;
+
+            Assert(after == before,
+                "成功上报后超时预算不变（RTT 历史未被清掉）",
+                $"{before.TotalSeconds:F1}s -> {after.TotalSeconds:F1}s");
+            Assert(after < TimeSpan.FromSeconds(12d),
+                "成功上报后仍保留慢端点预算（未退回 12s 上界）",
+                $"实际 {after.TotalSeconds:F1}s");
+
+            // 同时验证熔断计数确实被清零（该职责不能因为上面的修改而失效）
+            reportResult.Invoke(resolver, new object[] { endpoint, false });
+            reportResult.Invoke(resolver, new object[] { endpoint, true });
+            var (failures, blockedUntil) = GetEndpointState(resolver, endpoint);
+            Assert(failures == 0 && blockedUntil == DateTime.MinValue,
+                "成功上报后熔断计数确实清零",
+                $"Failures={failures}, BlockedUntil={blockedUntil:O}");
+        }
+
         /// <summary>
         /// 构造一个不写盘的 DohResolver（写盘会污染工作目录）
         /// </summary>

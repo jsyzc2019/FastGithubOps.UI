@@ -2,6 +2,7 @@ using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -45,9 +46,16 @@ namespace FastGithub.DomainResolve
         private static readonly TimeSpan positiveCacheTtl = TimeSpan.FromMinutes(10d);
 
         /// <summary>
-        /// 单次 DoH 请求的整体预算。本机网络到 DoH 端点的 RTT 可能达数秒
-        /// （与到 GitHub 的 RTT 同源），8s 曾在拥塞时把"慢但可用"的国内端点判死，
-        /// 导致所有端点均不可用。放宽到 12s 留足余量；端点级还有重试兜底。
+        /// 单次 DoH 请求的**上界**预算。
+        /// <para>
+        /// 本机网络到 DoH 端点的 RTT 可能达数秒（与到 GitHub 的 RTT 同源），8s 曾在拥塞时
+        /// 把"慢但可用"的国内端点判死，导致所有端点均不可用。
+        /// <para>
+        /// 【v2.6.6 P1-1】这是**上界**而非固定值：实际预算由
+        /// <see cref="GetTimeoutFor"/> 按该端点实测 RTT 在
+        /// [<see cref="minAdaptiveTimeout"/>, 本值] 区间内动态给出。
+        /// 快端点只会多等几秒，而慢端点不会因为被压到秒级预算而误判为死端点。
+        /// </para>
         /// </summary>
         private static readonly TimeSpan perRequestTimeout = TimeSpan.FromSeconds(12d);
 
@@ -207,8 +215,94 @@ namespace FastGithub.DomainResolve
             /// <summary>熔断截止时刻，未熔断时为 <see cref="DateTime.MinValue"/></summary>
             public DateTime BlockedUntil = DateTime.MinValue;
 
-            /// <summary>保护 <see cref="Failures"/> 与 <see cref="BlockedUntil"/> 的读-改-写</summary>
+            /// <summary>
+            /// 【v2.6.6 P1-1】该端点的 RTT 指数滑动平均（毫秒），0 表示尚无成功样本。
+            /// <para>用于按端点实际快慢动态计算超时，而非全局固定值。</para>
+            /// </summary>
+            public double RttEma;
+
+            /// <summary>保护上述字段的读-改-写</summary>
             public readonly object SyncRoot = new object();
+        }
+
+        /// <summary>
+        /// 【v2.6.6 P1-1】自适应超时的下界：3 秒。
+        /// <para>实测可用端点 RTT 仅 121~443ms，3 秒仍有 7~25 倍余量，
+        /// 足以吸收网络抖动，又远小于交互域名的 25s 整体预算。</para>
+        /// </summary>
+        private static readonly TimeSpan minAdaptiveTimeout = TimeSpan.FromSeconds(3d);
+
+        /// <summary>
+        /// 【v2.6.6 P1-1】自适应超时的上界，与 <see cref="perRequestTimeout"/> 同值，
+        /// 避免出现第二个"最大超时"定义而两者失配。
+        /// <para>不再放宽：交互域名整体预算 25s、usercontent 120s，
+        /// 单端点再往上加只会挤占重试机会而不会提高成功率。</para>
+        /// </summary>
+        private static readonly TimeSpan maxAdaptiveTimeout = perRequestTimeout;
+
+        /// <summary>
+        /// 超时 = 该端点实测 RTT 的多少倍。
+        /// <para>取 3 倍：DoH 响应体只有几十字节，正常情况下 RTT 就是全部耗时，
+        /// 3 倍余量足以覆盖 TCP 重传一次（~1 个 RTT）与调度抖动。
+        /// 倍数过小会在抖动时把好端点误判为死（进而触发熔断），
+        /// 倍数过大则失去"尽早发现死端点"的意义。</para>
+        /// </summary>
+        private const double adaptiveTimeoutFactor = 3d;
+
+        /// <summary>
+        /// RTT 指数滑动平均中"新样本"的权重。
+        /// <para>取 0.3 而非 0.5：网络劣化是**渐变**过程（v2.6.5 长时日志实测 6 小时内
+        /// RTT 变化一个数量级），权重过高会让单次抖动把均值带偏并立刻反映到超时上；
+        /// 0.3 既能在约 5 次样本内跟上劣化，又不会被一次偶发慢包放大。</para>
+        /// </summary>
+        private const double rtaEmaWeight = 0.3d;
+
+        /// <summary>
+        /// 按端点实测 RTT 计算该端点的超时预算。
+        /// <para>
+        /// 【为什么必须自适应，而不是调大固定值】v2.6.5 长时日志里同一批 DoH 端点的
+        /// RTT 在 6 小时内变化了一个数量级 —— 任何固定常数在网络环境变化后都会失配：
+        /// 定得小则把慢端点判死并熔断，定得大则让真死端点拖满预算。
+        /// 自适应让"多等一会儿"的代价只落在**本身较慢**的端点上，
+        /// 而快端点仍以百毫秒级返回，两者互不影响。
+        /// </para>
+        /// </summary>
+        /// <param name="endpoint">端点</param>
+        /// <returns>该端点本次请求的超时预算（已夹在 <see cref="minAdaptiveTimeout"/> 与 <see cref="maxAdaptiveTimeout"/> 之间）</returns>
+        private TimeSpan GetTimeoutFor(string endpoint)
+        {
+            var state = this.endpointHealth.GetOrAdd(endpoint, _ => new EndpointState());
+            lock (state.SyncRoot)
+            {
+                if (state.RttEma <= 0d)
+                {
+                    // 尚无成功样本（首次访问或一直失败）：退到上界，
+                    // 不因为"还不知道有多快"而先斩断它的机会。
+                    return maxAdaptiveTimeout;
+                }
+
+                var scaled = TimeSpan.FromMilliseconds(state.RttEma * adaptiveTimeoutFactor);
+                if (scaled < minAdaptiveTimeout)
+                {
+                    return minAdaptiveTimeout;
+                }
+
+                return scaled > maxAdaptiveTimeout ? maxAdaptiveTimeout : scaled;
+            }
+        }
+
+        /// <summary>
+        /// 用本次成功响应的耗时更新端点的 RTT 滑动平均。
+        /// </summary>
+        private void ReportEndpointRtt(string endpoint, double elapsedMilliseconds)
+        {
+            var state = this.endpointHealth.GetOrAdd(endpoint, _ => new EndpointState());
+            lock (state.SyncRoot)
+            {
+                state.RttEma = state.RttEma <= 0d
+                    ? elapsedMilliseconds
+                    : state.RttEma * (1d - rtaEmaWeight) + elapsedMilliseconds * rtaEmaWeight;
+            }
         }
 
         /// <summary>
@@ -585,13 +679,29 @@ namespace FastGithub.DomainResolve
         /// （几十个域名同时失败，只有一个能写入），导致熔断永不触发。
         /// 现在用 lock，累加保证不丢；成功/失败的相互覆盖也按时间顺序正确处理。
         /// </para>
+        /// <para>
+        /// 【v2.6.6 P1-1】成功时**只清熔断状态、保留 RTT 统计**。
+        /// 原实现用 <c>TryRemove</c> 整条删除，端点状态同时承担熔断与 RTT 两个职责，
+        /// 于是每次成功都会把 RTT 历史一起抹掉 → 下次 GetTimeoutFor 又退回
+        /// "无样本" 的 12s 上界，**自适应完全失效**（恰好在端点最健康、最该快的时候失效）。
+        /// </para>
         /// </summary>
         private void ReportEndpointResult(string endpoint, bool success)
         {
+            var state = this.endpointHealth.GetOrAdd(endpoint, _ => new EndpointState());
             if (success)
             {
-                var hadState = this.endpointHealth.TryRemove(endpoint, out _);
-                if (hadState)
+                var shouldPersist = false;
+                lock (state.SyncRoot)
+                {
+                    // 只清熔断相关字段，RttEma 保留 —— 它反映的是这个端点的客观快慢，
+                    // 与"这次是否成功"无关，不该被一次成功抹掉。
+                    shouldPersist = state.BlockedUntil > DateTime.UtcNow || state.Failures > 0;
+                    state.Failures = 0;
+                    state.BlockedUntil = DateTime.MinValue;
+                }
+
+                if (shouldPersist)
                 {
                     // 该端点曾被判死，现已恢复可用：清掉落盘记录，避免下次启动继续跳过它
                     this.PersistEndpointHealth();
@@ -600,7 +710,6 @@ namespace FastGithub.DomainResolve
             }
 
             var newlyBlocked = false;
-            var state = this.endpointHealth.GetOrAdd(endpoint, _ => new EndpointState());
             lock (state.SyncRoot)
             {
                 if (state.BlockedUntil > DateTime.UtcNow)
@@ -709,14 +818,28 @@ namespace FastGithub.DomainResolve
             // 只有 endpointCts 超时（真实失败）才上报熔断；
             // raceToken 取消（他人胜出）**不产生任何信号** —— 既不记失败（避免误熔慢端点），
             // 也不记成功（否则会把跨境死端点的失败计数清零，熔断永远攒不够次数）。
-            using var endpointCts = new CancellationTokenSource(perRequestTimeout);
-
+            // 【v2.6.6 P1-1】超时预算按端点实测 RTT 动态计算，而不是全局固定 12s。
+            // v2.6.5 长时日志显示同一批端点的 RTT 在 6 小时内变化了一个数量级，
+            // 固定常数必然在网络环境变化后失配：定小则误判慢端点为死并熔断，
+            // 定大则让真死端点拖满预算。此处取"该端点当前应有"的预算，
+            // 快端点仍以百毫秒级返回，只有本身较慢的端点才会多等。
+            //
+            // 【每次尝试单独取预算】重试的意义就是"再给一次机会"，
+            // 若两次尝试共享一个 CancellationTokenSource，第二次启动时剩余预算可能已所剩无几，
+            // 等于没有重试。
             const int maxTries = 2;
             for (var attempt = 0; attempt < maxTries; attempt++)
             {
-                var result = await QueryEndpointAsync(endpoint, dnsParam, endpointCts.Token, raceToken);
+                var timeout = GetTimeoutFor(endpoint);
+                using var endpointCts = new CancellationTokenSource(timeout);
+                var startedAt = Stopwatch.GetTimestamp();
+
+                var result = await QueryEndpointAsync(endpoint, dnsParam, endpointCts.Token, raceToken, timeout);
                 if (result.Count > 0)
                 {
+                    // 只有拿到答案的那次请求才计入 RTT 统计：
+                    // 超时请求的耗时恒等于超时预算，把它算进去会让 RTT 单调爬升到上界。
+                    this.ReportEndpointRtt(endpoint, Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds);
                     this.ReportEndpointResult(endpoint, success: true);
                     return result;
                 }
@@ -767,11 +890,15 @@ namespace FastGithub.DomainResolve
         /// 二者任一触发都返回空列表，但**含义完全不同**，由调用方据此决定是否计入熔断。
         /// </para>
         /// </summary>
+        /// <param name="endpointToken">本端点超时令牌（真实失败的唯一来源）</param>
+        /// <param name="raceToken">竞速令牌（他人胜出 / 整体停机）</param>
+        /// <param name="timeout">本次请求实际生效的超时预算，仅用于日志展示</param>
         private async Task<IReadOnlyList<IPAddress>> QueryEndpointAsync(
             string endpoint,
             string dnsParam,
             CancellationToken endpointToken,
-            CancellationToken raceToken)
+            CancellationToken raceToken,
+            TimeSpan timeout)
         {
             // 【v2.6.4 关键修正】闸门只保护"发起请求"这个瞬时动作，**不覆盖整个等待过程**。
             //
@@ -838,7 +965,7 @@ namespace FastGithub.DomainResolve
                 // 导致 98 分钟故障窗口里一条端点级线索都没有。
                 if (endpointToken.IsCancellationRequested && raceToken.IsCancellationRequested == false)
                 {
-                    this.logger.LogDebug($"DoH 端点 {endpoint} 超时（{perRequestTimeout.TotalSeconds:F0}s）");
+                    this.logger.LogDebug($"DoH 端点 {endpoint} 超时（本次预算 {timeout.TotalSeconds:F1}s）");
                 }
 
                 return Array.Empty<IPAddress>();

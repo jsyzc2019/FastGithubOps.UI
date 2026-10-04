@@ -333,7 +333,10 @@ namespace FastGithub.DomainResolve
         {
             this.logger.LogInformation("手动触发IP刷新：仅使用在线hosts源");
             this.addressService.ClearCache();
-            await this.hostsService.RefreshAsync(cancellationToken);
+
+            // 【v2.6.6 P1-2】force=true：用户显式点击"刷新"，必须真的去拉一次源，
+            // 不能被后台 5 分钟节流挡成"点了没反应"。
+            await this.hostsService.RefreshAsync(cancellationToken, force: true);
             await this.TestSpeedAsync(hostsOnly: true, cancellationToken);
         }
 
