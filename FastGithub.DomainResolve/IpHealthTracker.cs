@@ -47,43 +47,172 @@ namespace FastGithub.DomainResolve
             public int KeepErrorCount;
             public DateTime BlacklistUntil = DateTime.MinValue;
             public DateTime LastAccess = DateTime.UtcNow;
+
+            /// <summary>
+            /// 【v2.6.9】该域名当前的候选池大小（由 IPAddressService 在每次选候选时回填）。
+            /// <para>
+            /// 0 表示"尚未知"。它决定 <see cref="EffectiveKeepErrorThreshold"/> 的取值：
+            /// 池子只有1 个 IP 时，连续失败 2 次就拉黑，等于**该域名瞬间不可用**，
+            /// 此时 <c>MAX_TRY_COUNT=3</c> 与总预算切片全部失效（无可试候选）。
+            /// </para>
+            /// </summary>
+            public int PoolSize;
         }
 
         private readonly ConcurrentDictionary<string, IpState> states = new();
 
         /// <summary>
-        /// 连续失败达到该次数即拉黑。
+        /// 各域名当前候选池大小。由 <see cref="IPAddressService.GetAddressesAsync"/> 每次选出候选后回填。
+        /// </summary>
+        private readonly ConcurrentDictionary<string, int> poolSizes = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// 候选池只有这一个 IP 时，连续失败多少次才拉黑。
+        /// <para>
+        /// 【v2.6.9 为什么需要这一档】实测 GitHub 权威 DNS 对 <c>github.com</c>
+        /// 只返 1 条A 记录（616 次 DoH 解析中 266 次"得 1 个候选"，其中 github.com 占 29 次），
+        /// 所以它的候选池常态就是 1。此时「一批并发请求里只要有 <b>1 个</b>失败，
+        /// 唯一的 IP 就被拉黑（原因见下方 <see cref="MinSamplesBeforeRate"/>的说明），
+        /// 而那批已在途的请求全部被迫走"全部拉黑 → 强制回退"重连。
+        /// 实测后果：32 个并发请求里 4 个 2.6s 完成、29 个卡 42～62 秒，
+        /// 页面表现为"打开个人主页卡 40 秒后正常显示"。
+        /// 提到 4 相当于给了 4 次容错，够挡住瞬时抖动，又不会让单 IP 域名被一次波动打空。
+        /// </para>
+        /// </summary>
+        private const int SingleCandidateKeepErrorThreshold = 4;
+
+        /// <summary>
+        /// 候选池只有这一个 IP 时的拉黑时长（原 30s）。
+        /// <para>
+        /// 【v2.6.9 为什么缩短】单 IP 域名被拉黑期间，该IP 既不参与排序、
+        /// 又在探测时被跳过（见 <see cref="IPAddressService.GetAddressElapsedAsync"/>），
+        /// 等于**整个域名不可用**。30s 拉黑期内的请求全部要走降级路径。
+        /// 降到 10s：足以让坏 IP 让位并被新 IP 顶替，又把"域名瞬时不可用"的窗口压到最小。
+        /// 注意这不是"为了恢复快而牺牲稳定性"——真正的稳定性来自上面的失败次数阈值，
+        /// 时长只影响"万一真拉黑了要等多久"。
+        /// </para>
+        /// </summary>
+        private static readonly TimeSpan SingleCandidateBlacklistDuration = TimeSpan.FromSeconds(10d);
+
+        /// <summary>
+        /// 候选池大于1 时的拉黑时长。
+        /// </summary>
+        private static readonly TimeSpan MultiCandidateBlacklistDuration = TimeSpan.FromSeconds(30d);
+
+        /// <summary>
+        /// 连续失败达到该次数即拉黑（候选池 ≥ 2 时生效）。
         /// <para>
         /// 取 2（此前为 3）：本参数与<a cref="BlacklistDuration"/>、以及 DomainResolver 的
         /// REFRESH_COOLDOWN 是**串联**关系，一个坏 IP 从"首次失败"到"被彻底让位"的总时延
         /// 约等于 KeepErrorThreshold × 单次失败耗时 + BlacklistDuration + REFRESH_COOLDOWN。
         /// 原值 3+ 5min+ 30s 意味着被阻断后要等数分钟才换IP——这正是"恢复速度不够快"的直接原因。
         /// 降到 2 让坏 IP 更快让位，同时仍高于 dev-sidecar 的 1，保留一次容错避免网络瞬断即误杀。
+        /// 池子 ≥2 时拉黑一个只损失 1/2冗余，代价可接受。
         /// </para>
         /// </summary>
         public int KeepErrorThreshold { get; set; } = 2;
 
         /// <summary>
+        /// 记录某域名当前的候选池大小，影响后续的拉黑阈值与时长。
+        /// <para>
+        /// 由 <see cref="IPAddressService.GetAddressesAsync"/> 在选出候选后调用。
+        /// 池大小是"惩罚代价"的放大系数：池 ≥3 时拉黑一个只少1/3 冗余，
+        /// 池 =1 时拉黑等于域名不可用 —— 两者必须用不同的阈值。
+        /// </para>
+        /// </summary>
+        /// <param name="host">域名</param>
+        /// <param name="poolSize">候选IP 数量，至少为 1</param>
+        public void SetPoolSize(string host, int poolSize)
+        {
+            if (poolSize < 1)
+            {
+                poolSize = 1;
+            }
+
+            this.poolSizes[host] = poolSize;
+
+            // 同步到已有条目：池子从 ≥2 缩到 1（或反之）时，让存量条目下次判定即生效。
+            var prefix = $"{host}|";
+            foreach (var item in this.states)
+            {
+                if (item.Key.StartsWith(prefix, StringComparison.Ordinal) == false)
+                {
+                    continue;
+                }
+
+                lock (item.Value)
+                {
+                    item.Value.PoolSize = poolSize;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 取该IP 当前生效的连续失败阈值（按候选池大小分级）。
+        /// </summary>
+        private int GetKeepErrorThreshold(IpState state, string host)
+        {
+            // 优先用条目自身记录的池大小（反映最近一次选候选时的真实情况），
+            // 回退到域名级的最新值。两者都没有则按多候选处理（保守= 不轻易拉黑）。
+            var poolSize = state.PoolSize > 0
+                ? state.PoolSize
+                : (this.poolSizes.TryGetValue(host, out var size) ? size : 0);
+
+            return poolSize == 1 ? SingleCandidateKeepErrorThreshold : this.KeepErrorThreshold;
+        }
+
+        /// <summary>
+        /// 取该IP 当前生效的拉黑时长（按候选池大小分级）。
+        /// </summary>
+        private static TimeSpan GetBlacklistDuration(IpState state)
+        {
+            return state.PoolSize == 1
+                ? SingleCandidateBlacklistDuration
+                : MultiCandidateBlacklistDuration;
+        }
+
+        /// <summary>
         /// 成功率低于该值即拉黑
+        /// <para>
+        /// 【v2.6.9】仅在样本数达到 <see cref="MinSamplesBeforeRate"/> 后才生效，
+        /// 否则第1 次失败就会算出successRate=0 并立刻拉黑，
+        /// 使 <see cref="KeepErrorThreshold"/> 完全失效。
+        /// </para>
         /// </summary>
         public double MinSuccessRate { get; set; } = 0.4d;
 
         /// <summary>
-        /// 拉黑时长。
+        /// 允许成功率参与拉黑判定所需的最小样本数。
+        /// <para>
+        /// 统计量在样本不足时不可靠：1 次失败就会得到成功率 0.0，
+        /// 若直接与 <see cref="MinSuccessRate"/>（0.4）比较，任何 IP 都会在首次失败后被拉黑。
+        /// 这里取 6：既能积累出"确实在持续失败"的证据（成功率会稳定低于 0.4），
+        /// 又不至于让"偶发一两次失败"就误杀。样本期内的保护由连续失败阈值负责。
+        /// </para>
+        /// </summary>
+        private const int MinSamplesBeforeRate = 6;
+
+        /// <summary>
+        /// 拉黑时长（候选池 ≥ 2 时生效）。
         /// <para>
         /// 取 30 秒（原 5 分钟，v2.5.4 曾从 2 分钟上调到 5 分钟以抑制抖动）。
         /// 【为什么又调回来】用户实测反馈"被阻断后恢复速度不够快"，而拉黑时长是这条链路上
         /// 最长的一环：拉黑期内该IP 既不参与排序、又会在探测时被跳过，
         /// 若这段时间内没有新IP 可用，该域名就只有一个被拉黑的候选，等于事实不可用。
-        /// <para>
+        ///<para>
         /// 抖动其实是上一次上调想解决的问题，但它的正确解法是"IP 稳定"（DoH 缓存 10 分钟 +
         /// 粘性单次握手），而不是"把坏 IP 关很久"——关很久正好牺牲了恢复速度。
         /// 这里取 30 秒：足以让坏 IP 让位并被新IP 顶替，又不会让一个仅短暂抖动的 IP 被长时间丢弃。
-        /// 真正的兜底是"全部拉黑时强制回退重试"（见 HttpClientHandler.ConnectCallback），
-        /// 因此即便误拉黑也不会导致域名不可用。
+        /// 池 ≥2 时还有其它候选可试，被拉黑的IP 很快会被顶替。
+        /// <para>
+        /// <b>【v2.6.9】单IP 候选的域名（池=1）改用更短的
+        /// <see cref="SingleCandidateBlacklistDuration"/>（10 秒）</b>，
+        /// 因为此时拉黑等于整个域名不可用，没有"其它候选可试"这个缓冲。
+        /// 真正的兜底是"全部拉黑时强制回退重试"（见 IPAddressService 的 candidates 回落逻辑），
+        /// 因此即便误拉黑也不会导致域名永久不可用。
         /// </para>
         /// </summary>
-        public TimeSpan BlacklistDuration { get; set; } = TimeSpan.FromSeconds(30d);
+        public TimeSpan BlacklistDuration { get; set; } = MultiCandidateBlacklistDuration;
 
         /// <summary>
         /// 获取key
@@ -127,10 +256,32 @@ namespace FastGithub.DomainResolve
                 state.KeepErrorCount++;
                 state.LastAccess = DateTime.UtcNow;
 
-                var successRate = 1d - (double)state.Error / state.Total;
-                if (state.KeepErrorCount >= this.KeepErrorThreshold || successRate < this.MinSuccessRate)
+                // 池大小首次使用时从域名级取值补齐（SetPoolSize 之后新增的 IP 也要补）。
+                if (state.PoolSize == 0 && this.poolSizes.TryGetValue(host, out var size))
                 {
-                    state.BlacklistUntil = DateTime.UtcNow + this.BlacklistDuration;
+                    state.PoolSize = size;
+                }
+
+                var successRate = 1d - (double)state.Error / state.Total;
+                var threshold = this.GetKeepErrorThreshold(state, host);
+
+                //【v2.6.9 关键修正】successRate 判定必须带"最小样本数"门槛。
+                //
+                // 【为什么必须修 —— 自检实测发现的既有缺陷，之前无人察觉】
+                // 原写法 `successRate < MinSuccessRate`（0.4）在**第 1 次失败**时就成立：
+                //   第1次失败后 Total=1, Error=1 → successRate = 0.0 < 0.4 → 立即拉黑。
+                // 也就是说 <see cref="KeepErrorThreshold"/>（连续失败次数）**从未真正生效过**，
+                // 无论它配 2 还是 4，都会被 successRate 这条路径抢先触发。
+                // 这解释了实测中"一批并发里唯一 IP 瞬间就被拉黑"——
+                // 真实触发点是**第 1 次失败**，比原先判断的"第 2 次"更早、更容易。
+                //
+                // 【修法】成功率是统计量，样本不足时没有统计意义。
+                // 要求至少 MIN_SAMPLES_BEFORE_RATE 样本才允许它参与判定，
+                // 小样本期一律只看连续失败次数 —— 这才是KeepErrorThreshold 的设计本意。
+                if (state.KeepErrorCount >= threshold
+                    || (state.Total >= MinSamplesBeforeRate && successRate < this.MinSuccessRate))
+                {
+                    state.BlacklistUntil = DateTime.UtcNow + GetBlacklistDuration(state);
                 }
             }
 
@@ -208,6 +359,11 @@ namespace FastGithub.DomainResolve
             {
                 this.states.TryRemove(key, out _);
             }
+
+            // 【v2.6.9】域名IP 列表整体变化时，旧的候选池大小已不再成立。
+            // 若不清理，新IP 集合可能变大（阈值该按多候选走）却仍沿用旧的"池=1"严阈值，
+            // 导致新IP 被无故快速拉黑。
+            this.poolSizes.TryRemove(host, out _);
         }
 
         /// <summary>

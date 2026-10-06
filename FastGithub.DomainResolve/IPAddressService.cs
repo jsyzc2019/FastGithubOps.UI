@@ -122,6 +122,13 @@ namespace FastGithub.DomainResolve
 
             var candidates = healthy.Length > 0 ? healthy : connectable;
 
+            // 【v2.6.9】把候选池大小回填给健康度跟踪器。
+            // 池大小决定"拉黑一个 IP 的代价"：池 ≥2 时拉黑一个只损失 1/2 冗余，
+            // 池 =1 时拉黑等于**整个域名瞬时不可用**（实测 github.com 常态就是 1 个候选，
+            // 因为 GitHub 权威 DNS 对它只返 1 条 A 记录）。
+            // 必须让跟踪器知道这个数字，才能对单 IP 域名用更严的失败阈值与更短的拉黑时长。
+            this.healthTracker.SetPoolSize(host, candidates.Length);
+
             // 健康度优先于时延：一个"握手快但连不通"的IP毫无价值（dev-sidecar 的 doRank 思路）
             return candidates
                 .OrderBy(item => this.healthTracker.GetPenalty(host, item.Address))

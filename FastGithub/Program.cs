@@ -82,6 +82,10 @@ namespace FastGithub
             var failed = IpAddressFilterSelfTest.Run();
             failed += DohBackoffSelfTest.Run();
 
+            // 【v2.6.9】必须有调用点：过去IpAddressFilterSelfTest 写好了却从未被调用，
+            // 等于从未真正执行过。新增自检若不同步注册，同样会重蹈覆辙。
+            failed += IpHealthTrackerSelfTest.Run();
+
             Console.WriteLine(failed == 0
                 ? "=== 自检全部通过 ==="
                 : $"=== 自检失败 {failed} 项 ===");
