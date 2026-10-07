@@ -87,28 +87,44 @@ namespace FastGithub.DomainResolve
         }
 
         /// <summary>
-        /// 单 IP 域名的拉黑时长应显著短于多候选（10s vs 30s）：
-        /// 池=1 时拉黑期内该域名完全不可用，窗口必须最小化。
+        /// 拉黑时长必须 ≥ 一次慢建连所需的时间。
+        /// <para>
+        /// 【v2.6.10 修订】本用例原先断言"池=1 的拉黑时长应**短于**多候选（10s vs 30s）"，
+        /// v2.6.9 据此把池=1 压到 10s。但 v2.6.9 实测日志
+        /// （publish/v269/logs/log20261007.txt）证明该方向过头：
+        /// <c>camo.githubusercontent.com</c> 建连 p50=10.8s / p90=46.5s，
+        /// 属"**建连本身就慢**"的域名 —— 10s 拉黑窗**短于一次正常握手**，
+        /// 导致该 IP 被反复拉黑又反复放行，永远在抖动。
+        /// </para>
+        /// <para>
+        /// 现在池=1 与池≥2 同为 30s，因此断言方向也随之改变：
+        /// **不再要求池=1 更短**，只要求"拉黑窗 ≥ 慢建连可完成"这一硬下限。
+        /// 真正的差异化保护由失败次数阈值承担（池=1 需 4 次、池≥2 需 2 次），
+        /// 见 <see cref="TestSingleCandidateNeedsMoreFailures"/>。
+        /// </para>
         /// </summary>
         private static void TestSingleCandidateBlacklistShorter()
         {
             var single = MeasureBlacklistSeconds(1);
             var multi = MeasureBlacklistSeconds(3);
 
-            if (single >= multi)
+            // 硬下限：拉黑窗必须 ≥ 20s，否则慢建连域名（camo p50=10.8s / p90=46.5s）
+            // 的 IP 会在一次正常握手完成前就被拉黑并重新放行，形成抖动。
+            if (single < 20 || multi < 20)
             {
                 failed++;
-                Console.WriteLine($"  FAIL 池=1 的拉黑时长({single}s) 应短于池≥2({multi}s)");
+                Console.WriteLine($"  FAIL 拉黑窗过短（单={single}s 多={multi}s），慢建连域名会反复抖动（期望 ≥20s）");
             }
             else
             {
-                Console.WriteLine($"  OK   拉黑时长按池大小分级：池=1 → {single}s，池≥2 → {multi}s");
+                Console.WriteLine($"  OK   拉黑窗均 ≥ 慢建连耗时：池=1 → {single}s，池≥2 → {multi}s");
             }
 
-            if (single > 15 || multi > 35)
+            // 上限：仍需有界，避免真死 IP 长时间占据唯一候选。
+            if (single > 60 || multi > 60)
             {
                 failed++;
-                Console.WriteLine($"  FAIL 拉黑时长越界：单={single}s 多={multi}s（期望 ≤15s / ≤35s）");
+                Console.WriteLine($"  FAIL 拉黑时长越界：单={single}s 多={multi}s（期望 ≤60s）");
             }
             else
             {

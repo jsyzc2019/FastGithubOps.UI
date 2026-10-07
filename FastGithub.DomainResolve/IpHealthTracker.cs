@@ -82,17 +82,30 @@ namespace FastGithub.DomainResolve
         private const int SingleCandidateKeepErrorThreshold = 4;
 
         /// <summary>
-        /// 候选池只有这一个 IP 时的拉黑时长（原 30s）。
+        /// 候选池只有这一个 IP 时的拉黑时长。
         /// <para>
-        /// 【v2.6.9 为什么缩短】单 IP 域名被拉黑期间，该IP 既不参与排序、
-        /// 又在探测时被跳过（见 <see cref="IPAddressService.GetAddressElapsedAsync"/>），
-        /// 等于**整个域名不可用**。30s 拉黑期内的请求全部要走降级路径。
-        /// 降到 10s：足以让坏 IP 让位并被新 IP 顶替，又把"域名瞬时不可用"的窗口压到最小。
-        /// 注意这不是"为了恢复快而牺牲稳定性"——真正的稳定性来自上面的失败次数阈值，
-        /// 时长只影响"万一真拉黑了要等多久"。
+        /// 【v2.6.10 为什么从 10s 回调到 30s】v2.6.9 把它从 30s 压到 10s，
+        /// 目的是缩小"单 IP 域名被拉黑＝整域名瞬时不可用"的窗口。
+        /// 但 v2.6.9 实测日志（publish/v269/logs/log20261007.txt）证明这个方向过头了：
+        /// <c>camo.githubusercontent.com</c> 的建连 p50=**10.8s**、p90=**46.5s**
+        /// （&gt;10s 占 51.2%、&gt;30s 占 21.6%）——它属于"**建连本身就慢**"的域名。
+        /// 慢建连的失败与"IP 已死"是两回事：TCP+TLS 握手本来就要十几秒，
+        /// 而 10s 拉黑窗远短于一次正常建连，导致
+        /// <list type="bullet">
+        /// <item>IP 被拉黑 10s → 刚过冷却期立刻又被判定失败 → 反复拉黑，
+        /// 该 IP 实际上处于"永远在拉黑与放行之间抖动"的状态；</item>
+        /// <item>而用户侧看到的是 camo 图片 p50 10.8s 的加载卡顿。</item>
+        /// </list>
+        /// 实测"在 10s 内未能连接"（总预算耗尽）141 次，其中
+        /// "已尝试 1/3 个候选" 29 次、"1/2" 17 次 —— 池子明明有多个候选，
+        /// 却在第 1 个候选耗尽总预算后直接 break，候选 2、3 根本没被试。
+        /// <para>
+        /// 因此回调到 30s（与池 ≥2 对齐）：让慢建连的IP 有足够时间完成一次正常握手，
+        /// 而不是被反复拉黑。对比 v2.6.8 之前的 30s 也不会退化为"恢复慢"——
+        /// 真正的兜底是"全部拉黑时强制回退重试"，且 v2.6.9 已把失败次数阈值放宽到 4 次。
         /// </para>
         /// </summary>
-        private static readonly TimeSpan SingleCandidateBlacklistDuration = TimeSpan.FromSeconds(10d);
+        private static readonly TimeSpan SingleCandidateBlacklistDuration = TimeSpan.FromSeconds(30d);
 
         /// <summary>
         /// 候选池大于1 时的拉黑时长。

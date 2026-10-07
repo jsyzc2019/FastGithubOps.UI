@@ -782,15 +782,38 @@ namespace FastGithub.DomainResolve
                 var shouldPersist = false;
                 lock (state.SyncRoot)
                 {
+                    // 读出半开标记后再在末尾清零 —— 它决定"这次成功算不算真正恢复"。
+                    var wasHalfOpen = state.HalfOpen;
+
                     // 只清熔断相关字段，RttEma 保留 —— 它反映的是这个端点的客观快慢，
                     // 与"这次是否成功"无关，不该被一次成功抹掉。
                     shouldPersist = state.BlockedUntil > DateTime.UtcNow || state.Failures > 0;
                     state.Failures = 0;
                     state.BlockedUntil = DateTime.MinValue;
 
-                    // 成功即视为完全恢复：清空递增惩罚与半开标记。
-                    // 端点既然回来了，继续背着 16 分钟冷却只会让它白白被跳过。
-                    state.ConsecutiveBlocks = 0;
+                    // 【v2.6.10 关键修复】成功**不再**无条件清零递增惩罚的计数。
+                    //
+                    // 【v2.6.9 实测故障】publish/v269/logs/log20261007.txt 里
+                    // https://223.5.5.5/dns-query 从 14:12 到 19:10 反复熔断 **40+ 次**，
+                    // 而每一次的日志都是"已熔断 **2 分钟**" —— 递增冷却
+                    // （2→4→8→16→30 封顶）**从未生效过**。
+                    //
+                    // 【根因】原实现在成功分支里 `ConsecutiveBlocks = 0`。
+                    // 而该端点属"半可用"（故障窗口内 DoH 整体成功率 52.8%），
+                    // 它会在两次失败之间成功一次 —— 每次成功都把计数清零，
+                    // 于是 `ComputeCooldown(++state.ConsecutiveBlocks)` 永远取第 1 档。
+                    // 结果是熔断机制在"抖动型端点"上退化成「熔断 2 分钟 → 放行 → 再熔断 2 分钟」
+                    // 的无限抖动，恰是这个机制本该消除的行为。
+                    //
+                    // 【修法】只有**半开探测成功**（`wasHalfOpen`）才算端点真正恢复，
+                    // 此时才清零递增计数。普通轮次命中（端点本来就在正常服务、只是这次成功了）
+                    // 不清零 —— 它的成功不构成"恢复"的证据，
+                    // 真正的恢复必须由"冷却到期后放行的那一个试探请求"来证明。
+                    // 这样递增惩罚才能对间歇性可用端点真正升级。
+                    if (wasHalfOpen)
+                    {
+                        state.ConsecutiveBlocks = 0;
+                    }
                     state.HalfOpen = false;
                 }
 

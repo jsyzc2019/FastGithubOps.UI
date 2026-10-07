@@ -33,6 +33,8 @@ namespace FastGithub.DomainResolve
             TestSuccessKeepsRttHistory();
             TestCooldownEscalates();
             TestHalfOpenAllowsOnlyOneProbe();
+            TestCooldownEscalatesOnFlappingEndpoint();
+            TestHalfOpenSuccessResetsEscalation();
 
             Console.WriteLine(failed == 0
                 ? "  DohBackoffSelfTest: 全部通过"
@@ -512,6 +514,124 @@ namespace FastGithub.DomainResolve
                 "恢复后第二个请求同样正常放行（半开标记已清除）");
             Assert(GetEndpointState(resolver, endpoint).Failures == 0,
                 "恢复后失败计数清零");
+        }
+
+        /// <summary>
+        /// 【v2.6.10 新增】"抖动型端点"的递增冷却必须**真实升级**。
+        /// <para>
+        /// 【为什么要补这条】既有的 <see cref="TestCooldownEscalates"/> 只测
+        /// <c>ComputeCooldown</c> 这个**纯函数**本身正确，但它无法发现
+        /// "函数对、调用路径断"这类缺陷 —— 而 v2.6.9 的真实故障恰恰是后者：
+        /// <c>ReportEndpointResult</c> 的成功分支里有一句
+        /// <c>ConsecutiveBlocks = 0</c>，把递增计数清零，
+        /// 于是 <c>ComputeCooldown(++ConsecutiveBlocks)</c> 永远取第1 档。
+        /// <para>
+        /// 【v2.6.9 实测证据】publish/v269/logs/log20261007.txt 里
+        /// <c>223.5.5.5/dns-query</c> 从 14:12 到 19:10 反复熔断 40+ 次，
+        /// 每次日志都是"已熔断 <b>2 分钟</b>" —— 递增设计（2→4→8→16→30）
+        /// 从未生效，熔断退化成无限抖动。
+        /// <para>
+        /// 本用例复现该模式：失败→冷却到期→**普通成功**→再失败→冷却到期→…
+        /// 普通成功<b>不</b>构成"恢复"（真正的恢复必须由半开试探证明），
+        /// 因此熔断时长必须逐次拉长。
+        /// </para>
+        /// </summary>
+        private static void TestCooldownEscalatesOnFlappingEndpoint()
+        {
+            Console.WriteLine("抖动端点的递增冷却真实升级（普通成功不清零）");
+            var resolver = CreateResolver();
+            var report = InstanceMethod("ReportEndpointResult");
+            Assert(report != null, "ReportEndpointResult 方法存在");
+            if (report == null) return;
+
+            const string endpoint = "https://223.5.5.5/dns-query";
+            var cooldowns = new List<double>();
+
+            for (var round = 0; round < 3; round++)
+            {
+                // 本轮：连续失败 4 次 → 触发熔断
+                for (var i = 0; i < 4; i++)
+                {
+                    report.Invoke(resolver, new object[] { endpoint, false });
+                }
+
+                var blockedUntil = GetEndpointState(resolver, endpoint).BlockedUntil;
+                Assert(blockedUntil > DateTime.UtcNow, $"第 {round + 1} 轮：连续失败 4 次后进入熔断");
+                cooldowns.Add((blockedUntil - DateTime.UtcNow).TotalMinutes);
+
+                // 把冷却时刻移到过去，模拟冷却到期
+                var st = GetEndpointStateObject(resolver, endpoint);
+                if (st == null)
+                {
+                    failed++;
+                    Console.WriteLine("  FAIL 无法取得 EndpointState");
+                    return;
+                }
+                st.GetType().GetField("BlockedUntil")!.SetValue(st, DateTime.UtcNow.AddSeconds(-1d));
+
+                // 关键：一次**普通成功**（非半开试探）。
+                // 端点本来就在正常服务、这次恰好成功，不构成"恢复"。
+                report.Invoke(resolver, new object[] { endpoint, true });
+            }
+
+            // 递增必须真实发生：每一轮的熔断时长都要比上一轮更长
+            for (var i = 1; i < cooldowns.Count; i++)
+            {
+                Assert(
+                    cooldowns[i] > cooldowns[i - 1],
+                    $"第 {i + 1} 轮冷却({cooldowns[i]:F1} 分钟) 应长于第 {i} 轮({cooldowns[i-1]:F1} 分钟)",
+                    "普通成功清零了递增计数 → 递增机制对抖动端点永久失效");
+            }
+        }
+
+        /// <summary>
+        /// 【v2.6.10 新增】只有**半开试探成功**才允许清零递增计数。
+        /// <para>
+        /// 这是 <see cref="TestCooldownEscalatesOnFlappingEndpoint"/> 的必要配套：
+        /// 若半开成功也不清零，则真正恢复的端点会永远背着递增惩罚被跳过，
+        /// 属于矫枉过正。两个用例一起把"该清的清、不该清的不清"钉死。
+        /// </para>
+        /// </summary>
+        private static void TestHalfOpenSuccessResetsEscalation()
+        {
+            Console.WriteLine("半开试探成功才清零递增计数");
+            var resolver = CreateResolver();
+            var report = InstanceMethod("ReportEndpointResult");
+            var isBlocked = InstanceMethod("IsEndpointBlocked");
+            Assert(report != null && isBlocked != null, "反射目标存在");
+            if (report == null || isBlocked == null) return;
+
+            const string endpoint = "https://doh.pub/dns-query";
+
+            // 连续两轮"失败 → 冷却到期 → 普通成功"，让递增计数升到第 2 档
+            for (var round = 0; round < 2; round++)
+            {
+                for (var i = 0; i < 4; i++)
+                {
+                    report.Invoke(resolver, new object[] { endpoint, false });
+                }
+                var st = GetEndpointStateObject(resolver, endpoint);
+                if (st == null) { failed++; return; }
+                st.GetType().GetField("BlockedUntil")!.SetValue(st, DateTime.UtcNow.AddSeconds(-1d));
+                report.Invoke(resolver, new object[] { endpoint, true });
+            }
+
+            // 此刻应处于"第 2 次熔断"的冷却档（普通成功没有清零它）
+            var st2 = GetEndpointStateObject(resolver, endpoint);
+            var blocksBefore = (int)st2!.GetType().GetField("ConsecutiveBlocks")!.GetValue(st2)!;
+            Assert(blocksBefore >= 1, $"普通成功后递增计数仍在（ConsecutiveBlocks={blocksBefore}）");
+
+            // 现在走真正的恢复路径：冷却到期 → 半开试探 → 成功
+            st2.GetType().GetField("BlockedUntil")!.SetValue(st2, DateTime.UtcNow.AddSeconds(-1d));
+            var probe = (bool)isBlocked.Invoke(resolver, new object[] { endpoint })!;
+            Assert(probe == false, "冷却到期后放行半开试探请求");
+            report.Invoke(resolver, new object[] { endpoint, true });
+
+            var st3 = GetEndpointStateObject(resolver, endpoint)!;
+            var blocksAfter = (int)st3.GetType().GetField("ConsecutiveBlocks")!.GetValue(st3)!;
+            Assert(blocksAfter == 0, $"半开试探成功后递增计数清零（ConsecutiveBlocks={blocksAfter}）");
+            Assert((bool)isBlocked.Invoke(resolver, new object[] { endpoint })! == false,
+                "半开成功后端点完全恢复，不再被跳过");
         }
 
         /// <summary>
