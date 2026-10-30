@@ -22,6 +22,7 @@ namespace FastGithub
             services.TryAddSingleton<HostsService>();
             services.TryAddSingleton<PersistenceService>();
             services.TryAddSingleton<IpHealthTracker>();
+            services.TryAddSingleton<MetaIpRangesService>();
             services.TryAddSingleton<IPAddressService>();
             services.TryAddSingleton<IDomainResolver, DomainResolver>();
             services.AddHostedService<DomainResolveHostedService>();

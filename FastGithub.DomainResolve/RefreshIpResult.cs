@@ -34,5 +34,10 @@ namespace FastGithub.DomainResolve
         /// 在线hosts源更新失败的原因
         /// </summary>
         public string? HostsError { get; set; }
+
+        /// <summary>
+        /// 成功命中的 hosts 源 URL（v2.6.12 多源 failover 后定位实际来源）
+        /// </summary>
+        public string? HostsSource { get; set; }
     }
 }

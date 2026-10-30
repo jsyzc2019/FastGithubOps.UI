@@ -37,6 +37,7 @@ namespace FastGithub.DomainResolve
         private readonly HostsService hostsService;
         private readonly IpHealthTracker healthTracker;
         private readonly FastGithubConfig fastGithubConfig;
+        private readonly MetaIpRangesService metaRanges;
 
         /// <summary>
         /// IP服务
@@ -44,11 +45,14 @@ namespace FastGithub.DomainResolve
         /// <param name="dnsClient"></param>
         /// <param name="hostsService"></param>
         /// <param name="healthTracker"></param>
-        public IPAddressService(DnsClient dnsClient, HostsService hostsService, IpHealthTracker healthTracker, FastGithubConfig fastGithubConfig)
+        /// <param name="metaRanges"></param>
+        /// <param name="fastGithubConfig"></param>
+        public IPAddressService(DnsClient dnsClient, HostsService hostsService, IpHealthTracker healthTracker, MetaIpRangesService metaRanges, FastGithubConfig fastGithubConfig)
         {
             this.dnsClient = dnsClient;
             this.hostsService = hostsService;
             this.healthTracker = healthTracker;
+            this.metaRanges = metaRanges;
             this.fastGithubConfig = fastGithubConfig;
         }
 
@@ -92,6 +96,24 @@ namespace FastGithub.DomainResolve
                 ipEndPoints.Add(new IPEndPoint(address, dnsEndPoint.Port));
                 var domainAddress = new DomainAddress(dnsEndPoint.Host, address);
                 this.domainAddressCache.Set(domainAddress, default(object), this.domainAddressExpiration);
+            }
+
+            // 【v2.6.12 B1】GitHub 官方 meta 段扩充候选池。
+            // DNS 对 github.com 常态只回 1 条 A 记录（v2.6.9 实测），候选池=1 是单点：
+            // 该 IP 一旦被阻断，域名瞬时不可用且无替代。官方 web/api 段已验证覆盖
+            // github.com 真实 IP，从段内采样补充候选，走同一套握手竞速+健康度筛选。
+            // hostsOnly 轮次不扩充（那是"仅 hosts 源"语义，DNS 结果都不参与）；
+            // 采样失败/未取到数据时静默返回空，不影响主链路。
+            if (hostsOnly == false)
+            {
+                var sampled = this.metaRanges.TrySampleCandidates(
+                    dnsEndPoint.Host,
+                    ipEndPoints.Select(item => item.Address).ToArray());
+                foreach (var address in sampled)
+                {
+                    // 采样候选是探索性的：不写入 domainAddressCache（避免不可用IP长期占据历史缓存）
+                    ipEndPoints.Add(new IPEndPoint(address, dnsEndPoint.Port));
+                }
             }
 
             if (ipEndPoints.Count == 0)

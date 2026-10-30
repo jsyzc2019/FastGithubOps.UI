@@ -89,6 +89,9 @@ namespace FastGithub
             // 【v2.6.11】hosts 源 JSON/文本双格式解析自检
             failed += HostsSourceSelfTest.Run();
 
+            // 【v2.6.12】meta 官方段解析/归属/采样自检
+            failed += MetaRangeSelfTest.Run();
+
             Console.WriteLine(failed == 0
                 ? "=== 自检全部通过 ==="
                 : $"=== 自检失败 {failed} 项 ===");

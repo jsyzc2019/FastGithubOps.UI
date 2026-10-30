@@ -33,6 +33,11 @@ namespace FastGithub.DomainResolve
         public int DomainCount { get; init; }
 
         /// <summary>
+        /// 成功命中的源 URL（多源 failover 后定位实际来源；失败/禁用时为 null）
+        /// </summary>
+        public string? Source { get; init; }
+
+        /// <summary>
         /// 更新失败/被跳过的原因（成功时为 null）
         /// </summary>
         public string? Error { get; init; }
@@ -48,6 +53,11 @@ namespace FastGithub.DomainResolve
         private readonly IOptionsMonitor<FastGithubOptions> options;
         private readonly ILogger<HostsService> logger;
         private readonly ConcurrentDictionary<string, IReadOnlyList<IPAddress>> mapping = new();
+
+        /// <summary>
+        /// 最近一次成功拉取所用的源 URL（多源 failover 后供结果回报与节流跳过时引用）
+        /// </summary>
+        private volatile string? lastSuccessSource;
 
         /// <summary>
         /// 并发拉取合流（single-flight）。
@@ -137,7 +147,7 @@ namespace FastGithub.DomainResolve
         }
 
         /// <summary>
-        /// 刷新hosts映射，拉取远程hosts源并解析为“域名->IP”缓存
+        /// 刷新hosts映射，按序拉取在线hosts源（failover）并解析为“域名->IP”缓存
         /// </summary>
         /// <param name="cancellationToken"></param>
         /// <param name="force">
@@ -146,18 +156,18 @@ namespace FastGithub.DomainResolve
         /// 语义上必须"现在就去拉"，不能被后台节流挡住；
         /// 否则用户点了刷新却毫无反应，会被当成程序卡死。</para>
         /// </param>
-        /// <returns>刷新结果（成功与否、域名数、失败原因）</returns>
+        /// <returns>刷新结果（成功与否、域名数、成功来源、失败原因）</returns>
         public async Task<HostsRefreshResult> RefreshAsync(CancellationToken cancellationToken, bool force = false)
         {
-            var hostsUrl = this.options.CurrentValue.HostsUrl?.Trim();
-            if (string.IsNullOrEmpty(hostsUrl))
+            var sourceUrls = GetEffectiveSourceUrls(this.options.CurrentValue);
+            if (sourceUrls.Count == 0)
             {
                 // 显式禁用在线hosts源，只依赖本机DNS解析
                 if (this.mapping.IsEmpty == false)
                 {
                     this.mapping.Clear();
                 }
-                return new HostsRefreshResult { Success = false, DomainCount = 0, Error = "在线hosts源已禁用（HostsUrl 未配置）" };
+                return new HostsRefreshResult { Success = false, DomainCount = 0, Error = "在线hosts源已禁用（HostsUrls/HostsUrl 均未配置）" };
             }
 
             // 【v2.6.6 P1-2】全局节流：成功拉取的内容等价，5 分钟内的重复请求一律跳过。
@@ -167,14 +177,14 @@ namespace FastGithub.DomainResolve
                 this.lastSuccessAt != DateTime.MinValue &&
                 DateTime.UtcNow - this.lastSuccessAt < successRefreshInterval)
             {
-                return new HostsRefreshResult { Success = true, DomainCount = this.mapping.Count };
+                return new HostsRefreshResult { Success = true, DomainCount = this.mapping.Count, Source = this.lastSuccessSource };
             }
 
             // 合流：并发进入者等待首个请求的结果，而不是各自发一次。
             if (await this.refreshGate.WaitAsync(TimeSpan.FromSeconds(5d), cancellationToken) == false)
             {
                 this.logger.LogDebug("在线hosts源刷新正在进行中，本次跳过");
-                return new HostsRefreshResult { Success = true, DomainCount = this.mapping.Count };
+                return new HostsRefreshResult { Success = true, DomainCount = this.mapping.Count, Source = this.lastSuccessSource };
             }
 
             try
@@ -184,7 +194,7 @@ namespace FastGithub.DomainResolve
                     this.lastSuccessAt != DateTime.MinValue &&
                     DateTime.UtcNow - this.lastSuccessAt < successRefreshInterval)
                 {
-                    return new HostsRefreshResult { Success = true, DomainCount = this.mapping.Count };
+                    return new HostsRefreshResult { Success = true, DomainCount = this.mapping.Count, Source = this.lastSuccessSource };
                 }
 
                 // 失败退避：连续失败越多，等得越久（指数增长，封顶 2h）。
@@ -198,47 +208,86 @@ namespace FastGithub.DomainResolve
                         this.logger.LogDebug(
                             $"在线hosts源处于失败退避中（已连续失败 {this.consecutiveFailures} 次，" +
                             $"{(wait - elapsed).TotalMinutes:F1} 分钟后重试），本次跳过");
-                        return new HostsRefreshResult { Success = true, DomainCount = this.mapping.Count };
+                        return new HostsRefreshResult { Success = true, DomainCount = this.mapping.Count, Source = this.lastSuccessSource };
                     }
                 }
 
                 this.lastAttemptAt = DateTime.UtcNow;
 
-                var content = await this.httpClient.GetStringAsync(hostsUrl, cancellationToken);
-                var map = Parse(content, out var invalidCount);
-                this.invalidIpCount = invalidCount;
-
-                // 【关键】只有拿到**非空且可解析**的内容才替换映射。
-                // 原实现无条件先 Clear 再逐条填入：一旦源返回空文件或被劫持成空内容，
-                // 已有映射会被清空，程序立刻失去这条候选来源且无从恢复（要等下次成功拉取）。
-                if (map.Count > 0)
+                // 【v2.6.12 B2】多源 failover：按配置顺序逐源尝试，
+                // 第一个给出**非空且可解析**内容的源获胜；全部失败才计一次失败退避。
+                // 三源同时失效的概率远低于单源，hosts 通道从"赌一个源"变成"三选一"。
+                string? lastError = null;
+                foreach (var sourceUrl in sourceUrls)
                 {
-                    this.mapping.Clear();
-                    foreach (var item in map)
+                    try
                     {
-                        this.mapping[item.Key] = item.Value;
+                        var content = await this.httpClient.GetStringAsync(sourceUrl, cancellationToken);
+                        var map = Parse(content, out var invalidCount);
+                        if (map.Count == 0)
+                        {
+                            // 空内容/全部无法解析：不算网络失败，换下一个源
+                            lastError = $"{sourceUrl}: 返回空内容或全部条目无法解析";
+                            this.logger.LogWarning(lastError);
+                            continue;
+                        }
+
+                        this.invalidIpCount = invalidCount;
+
+                        // 【关键】只有拿到**非空且可解析**的内容才替换映射。
+                        // 无条件先 Clear 再逐条填入的话：一旦源返回空文件或被劫持成空内容，
+                        // 已有映射会被清空，程序立刻失去这条候选来源且无从恢复（要等下次成功拉取）。
+                        this.mapping.Clear();
+                        foreach (var item in map)
+                        {
+                            this.mapping[item.Key] = item.Value;
+                        }
+
+                        this.consecutiveFailures = 0;
+                        this.lastSuccessAt = DateTime.UtcNow;
+                        this.lastSuccessSource = sourceUrl;
+                        this.logger.LogInformation($"已更新在线hosts解析（来源 {sourceUrl}），共{this.mapping.Count}个域名");
+
+                        if (this.invalidIpCount > 0)
+                        {
+                            this.logger.LogWarning(
+                                $"在线hosts源中有 {this.invalidIpCount} 个无效IP（127.0.0.1 等环回地址、" +
+                                "私有网段或已知污染地址）已被丢弃。这类地址若被当作候选会把请求导向本机或错误目标。" +
+                                "如持续出现，说明该源已被污染，建议更换（FastGithub:HostsUrls）。");
+                        }
+
+                        return new HostsRefreshResult { Success = true, DomainCount = this.mapping.Count, Source = sourceUrl };
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        throw; // 整体停机，交由外层统一处理
+                    }
+                    catch (Exception ex)
+                    {
+                        lastError = $"{sourceUrl}: {ex.Message}";
+                        this.logger.LogWarning($"在线hosts源 {sourceUrl} 不可用，尝试下一个源：{ex.Message}");
                     }
                 }
-                else
+
+                // 全部源失败
+                this.consecutiveFailures++;
+
+                // 【保留旧映射】失败时**不**清空 mapping：一份几分钟前的映射
+                // 远比没有映射有用（DoH 是主路径，hosts 只是额外候选）。
+                // 但必须让用户知道当前用的是旧数据 —— 静默沿用会让人以为"源是好的"。
+                this.logger.LogWarning(
+                    $"在线hosts源全部不可用（第 {this.consecutiveFailures} 次，共 {sourceUrls.Count} 个源，保留上次成功拉取的 " +
+                    $"{this.mapping.Count} 个域名映射）：{lastError}");
+
+                if (this.consecutiveFailures == 3)
                 {
-                    this.logger.LogWarning(
-                        $"在线hosts源 {hostsUrl} 返回空内容或全部条目无法解析，" +
-                        "已保留上一次成功拉取的映射（如从未成功过则该源暂不提供候选IP）。");
+                    this.logger.LogError(
+                        $"在线hosts源已连续 {this.consecutiveFailures} 次全部不可用（{string.Join("、", sourceUrls)}）。" +
+                        "源内容会被本程序直接当作域名->IP映射使用，请确认源仍由可信方长期维护；" +
+                        "如需更换或禁用，可在 appsettings.json 中设置 FastGithub:HostsUrls。");
                 }
 
-                this.consecutiveFailures = 0;
-                this.lastSuccessAt = DateTime.UtcNow;
-                this.logger.LogInformation($"已更新在线hosts解析，共{this.mapping.Count}个域名");
-
-                if (this.invalidIpCount > 0)
-                {
-                    this.logger.LogWarning(
-                        $"在线hosts源中有 {this.invalidIpCount} 个无效IP（127.0.0.1 等环回地址、" +
-                        "私有网段或已知污染地址）已被丢弃。这类地址若被当作候选会把请求导向本机或错误目标。" +
-                        "如持续出现，说明该源已被污染，建议更换（FastGithub:HostsUrl）。");
-                }
-
-                return new HostsRefreshResult { Success = true, DomainCount = this.mapping.Count };
+                return new HostsRefreshResult { Success = false, DomainCount = this.mapping.Count, Error = lastError };
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -246,32 +295,32 @@ namespace FastGithub.DomainResolve
                 this.logger.LogDebug("在线hosts源刷新因程序停止而取消");
                 return new HostsRefreshResult { Success = false, DomainCount = this.mapping.Count, Error = "刷新已取消" };
             }
-            catch (Exception ex)
-            {
-                this.consecutiveFailures++;
-
-                // 【保留旧映射】失败时**不**清空 mapping：一份几分钟前的映射
-                // 远比没有映射有用（DoH 是主路径，hosts 只是额外候选）。
-                // 但必须让用户知道当前用的是旧数据 —— 静默沿用会让人以为"源是好的"。
-                this.logger.LogWarning(
-                    $"在线hosts源更新失败（第 {this.consecutiveFailures} 次，保留上次成功拉取的 " +
-                    $"{this.mapping.Count} 个域名映射）：{ex.Message}");
-
-                if (this.consecutiveFailures == 3)
-                {
-                    this.logger.LogError(
-                        $"在线hosts源 {hostsUrl} 已连续 {this.consecutiveFailures} 次不可用。" +
-                        "该地址返回的内容会被本程序直接当作域名->IP映射使用，" +
-                        "请确认该域名仍由可信方长期维护；" +
-                        "如需更换或禁用，可在 appsettings.json 中设置 FastGithub:HostsUrl。");
-                }
-
-                return new HostsRefreshResult { Success = false, DomainCount = this.mapping.Count, Error = ex.Message };
-            }
             finally
             {
                 this.refreshGate.Release();
             }
+        }
+
+        /// <summary>
+        /// 计算生效的hosts源列表：优先 HostsUrls（v2.6.12 多源），
+        /// 未配置时回退到 HostsUrl（v2.6.11 及以前单源，保留兼容）；均空 = 禁用。
+        /// </summary>
+        internal static IReadOnlyList<string> GetEffectiveSourceUrls(FastGithubOptions options)
+        {
+            var urls = new List<string>();
+            if (options.HostsUrls is { Length: > 0 })
+            {
+                urls.AddRange(options.HostsUrls);
+            }
+            else if (string.IsNullOrWhiteSpace(options.HostsUrl) == false)
+            {
+                urls.Add(options.HostsUrl);
+            }
+
+            return urls
+                .Where(u => string.IsNullOrWhiteSpace(u) == false)
+                .Select(u => u.Trim())
+                .ToList();
         }
 
         /// <summary>
