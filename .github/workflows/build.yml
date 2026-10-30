@@ -5,6 +5,7 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -20,15 +21,31 @@ jobs:
       with:
         dotnet-version: '10.0.x'
 
+    # 【v2.6.11】仓库的 NuGet.config 只配了华为云镜像（本机 restore 用），
+    # 该镜像在 GitHub runner 上 nupkg 下载损坏（"End of Central Directory"），
+    # 是 2026-10 全部 26 次 CI 失败的唯一根因。CI 内临时覆盖为 nuget.org，
+    # 只影响 runner 工作区，不改仓库文件。
+    - name: Use nuget.org feed (Huawei mirror is broken on runners)
+      shell: bash
+      run: |
+        cat > NuGet.config << 'EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <configuration>
+          <packageSources>
+            <clear />
+            <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
+          </packageSources>
+        </configuration>
+        EOF
+
     - name: Restore dependencies
       run: dotnet restore FastGithub.sln
 
     - name: Build
       run: dotnet build FastGithub.sln --no-restore --configuration Release
 
-    # 说明：本解决方案当前不含任何测试工程（8 个工程均为产品工程），
-    # `dotnet test` 在找不到测试项目时返回退出码 1 会使 job 失败，
-    # 因此不执行。将来补充测试工程后再把该步骤加回来。
+    # 说明：本解决方案不含 xunit/nunit 测试工程，`dotnet test` 会因找不到测试而失败。
+    # 逻辑正确性由 --SelfTest 内置自检承担（13+ 条健康度/熔断断言），见下方冒烟步骤。
 
   publish-win-x64:
     runs-on: windows-latest
@@ -40,6 +57,19 @@ jobs:
       uses: actions/setup-dotnet@v4
       with:
         dotnet-version: '10.0.x'
+
+    - name: Use nuget.org feed (Huawei mirror is broken on runners)
+      shell: bash
+      run: |
+        cat > NuGet.config << 'EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <configuration>
+          <packageSources>
+            <clear />
+            <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
+          </packageSources>
+        </configuration>
+        EOF
 
     - name: Publish main program
       # 不要加 -p:PublishTrimmed=true。YARP/ASP.NET Core 依赖运行时反射，
@@ -59,6 +89,13 @@ jobs:
         dotnet publish FastGithub.UI/FastGithub.UI.csproj `
           -c Release `
           -o ./publish/win-x64
+
+    # 冒烟自检：--SelfTest 跑健康度跟踪/DoH熔断等 13+ 条纯逻辑断言，
+    # 不需要管理员权限与真实网络。首次接入先 continue-on-error，
+    # 观察几轮稳定后再改为阻塞步骤。
+    - name: Self test (smoke)
+      continue-on-error: true
+      run: dotnet publish/win-x64/fastgithub.dll --SelfTest
 
     - name: Verify published files
       # 发布后立刻校验关键文件齐全，避免再次产出缺文件的包

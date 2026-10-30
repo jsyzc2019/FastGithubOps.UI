@@ -20,6 +20,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace FastGithub
@@ -151,13 +152,21 @@ namespace FastGithub
                 return context.Response.WriteAsync(json);
             });
 
-            // 触发IP刷新：拉取在线hosts源并解析测速（不发起DNS查询）
+            // 触发IP刷新：优先使用在线hosts源并重新测速，返回真实刷新结果。
+            // 【v2.6.11 关键修复，借鉴上游 v2.3.2】刷新不再绑定请求生命周期（context.RequestAborted）：
+            // 此前 UI 的 HttpClient 超时仅 10s，全量"清缓存→重解析→测速"一旦超过 10s，
+            // UI 断开会把刷新拦腰砍断 —— 而本刷新的语义是**先清缓存**，被砍断后系统处于
+            // "旧缓存已失效、新结果未就绪"的半刷新态，比不刷新更糟。
+            // 现用独立 45s 预算驱动：UI 等不等得到结果，刷新都完整走完。
+            // UI 侧（MainWindow.RefreshIpAsync）超时 60s，响应未到不中途断开。
             app.MapGet("/refresh-ip", async context =>
             {
                 var resolver = context.RequestServices.GetRequiredService<IDomainResolver>();
-                await resolver.RefreshHostsAsync(context.RequestAborted);
-                context.Response.ContentType = "text/plain;charset=utf-8";
-                await context.Response.WriteAsync("IP更新已触发");
+                using var timeoutTokenSource = new CancellationTokenSource(TimeSpan.FromSeconds(45d));
+                var result = await resolver.RefreshHostsAsync(timeoutTokenSource.Token);
+
+                context.Response.ContentType = "application/json;charset=utf-8";
+                await context.Response.WriteAsJsonAsync(result, timeoutTokenSource.Token);
             });
 
             // 【v2.6.4 新增】UI 退出时显式通知主程序停机。

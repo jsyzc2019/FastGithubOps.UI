@@ -129,22 +129,54 @@ namespace FastGithub.UI
         {
             try
             {
-                using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(10d) };
-                var response = await httpClient.GetAsync($"{AppPorts.UiHttpBaseUrl}/refresh-ip");
-                var message = await response.Content.ReadAsStringAsync();
+                // 【v2.6.11 借鉴上游 v2.3.2】两处修正：
+                // 1) 超时 10s -> 60s：后端刷新是"清缓存→拉hosts源→全量重测速"，
+                //    实测量级在十几秒；10s 会在刷新中途断开请求，
+                //    而后端已把请求绑定到刷新动作（旧版），等于把刷新拦腰砍断，
+                //    系统停在"缓存已清、新结果未就绪"的半刷新态。
+                //    （后端 v2.6.11 起已与请求生命周期解耦，这里是双保险。）
+                // 2) 后端返回 JSON 真实结果（域名数/可用IP数/hosts源状态），
+                //    弹泡直接展示结果，而不是永远"已发送请求，正在重新解析"。
+                using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(60d) };
+                var requestTask = httpClient.GetStringAsync($"{AppPorts.UiHttpBaseUrl}/refresh-ip");
 
-                // 主程序未运行时给出明确指引，而不是抛一句 IsSuccessStatusCode 的通用错误
-                if (response.IsSuccessStatusCode == false)
+                // 3 秒未完成先给一次反馈，避免点击后长时间没有任何提示
+                var completedTask = await Task.WhenAny(requestTask, Task.Delay(TimeSpan.FromSeconds(3d)));
+                if (completedTask != requestTask)
                 {
-                    this.notifyIcon.ShowBalloonTip(3000, FASTGITHUB_UI, $"IP更新失败：{message}", System.Windows.Forms.ToolTipIcon.Error);
-                    return;
+                    this.notifyIcon.ShowBalloonTip(3000, FASTGITHUB_UI, "IP更新进行中，正在重新解析与测速…", System.Windows.Forms.ToolTipIcon.Info);
                 }
 
-                this.notifyIcon.ShowBalloonTip(3000, FASTGITHUB_UI, "已发送IP更新请求，正在重新解析", System.Windows.Forms.ToolTipIcon.Info);
+                var json = await requestTask;
+
+                RefreshIpResult? result = null;
+                try
+                {
+                    result = Newtonsoft.Json.JsonConvert.DeserializeObject<RefreshIpResult>(json);
+                }
+                catch (Newtonsoft.Json.JsonException)
+                {
+                    // 后端为旧版本时返回纯文本，按"未知结果"处理
+                }
+
+                string message;
+                if (result != null)
+                {
+                    message = $"IP更新完成：{result.DomainCount}个域名、{result.AddressCount}个可用IP";
+                    message += result.HostsUpdated
+                        ? $"（在线hosts源{result.HostsDomainCount}个域名）"
+                        : $"（在线hosts源更新失败：{result.HostsError}）";
+                }
+                else
+                {
+                    message = "已触发IP更新，但后端未返回刷新结果（后端可能为旧版本）";
+                }
+
+                this.notifyIcon.ShowBalloonTip(5000, FASTGITHUB_UI, message, System.Windows.Forms.ToolTipIcon.Info);
             }
             catch (Exception ex)
             {
-                this.notifyIcon.ShowBalloonTip(3000, FASTGITHUB_UI, $"IP更新失败：{ex.Message}", System.Windows.Forms.ToolTipIcon.Error);
+                this.notifyIcon.ShowBalloonTip(5000, FASTGITHUB_UI, $"IP更新失败：{ex.Message}", System.Windows.Forms.ToolTipIcon.Error);
             }
         }
 

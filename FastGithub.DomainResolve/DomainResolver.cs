@@ -137,8 +137,8 @@ namespace FastGithub.DomainResolve
         /// </summary>
         /// <param name="hostsOnly">是否仅使用在线hosts源提供的IP</param>
         /// <param name="cancellationToken"></param>
-        /// <returns></returns>
-        private async Task TestSpeedAsync(bool hostsOnly, CancellationToken cancellationToken)
+        /// <returns>参与测速的域名数量与测速后可用的IP数量</returns>
+        private async Task<(int DomainCount, int AddressCount)> TestSpeedAsync(bool hostsOnly, CancellationToken cancellationToken)
         {
             // 【关键修复】原实现是串行 await 循环，而排序键是 Value.Length（当前IP数）。
             // 启动时几乎所有域名的持久化IP都是空数组，全部并列 Length=0，
@@ -155,22 +155,34 @@ namespace FastGithub.DomainResolve
             //   3) 单个域名失败只记录并继续，不能拖垮整轮 —— 原串行版本一个域名卡住就全线停摆；
             //   4) 并发写 dnsEndPointAddress 是安全的：该字典是 ConcurrentDictionary，
             //      且每格只由一个任务写。
+            //
+            // 【v2.6.11】返回真实计数，供 /refresh-ip 回报"刷了多少域名、剩多少可用IP"。
+            var domainCount = 0;
+            var addressCount = 0;
+
             var tasks = this.dnsEndPointAddress
                 .OrderBy(item => item.Value.Length)
-                .Select(keyValue => this.TestSpeedOneAsync(keyValue.Key, keyValue.Value, hostsOnly, cancellationToken))
+                .Select(keyValue => this.TestSpeedOneAsync(keyValue.Key, keyValue.Value, hostsOnly, cancellationToken,
+                    () => Interlocked.Increment(ref domainCount),
+                    addr => Interlocked.Add(ref addressCount, addr)))
                 .ToArray();
 
             await Task.WhenAll(tasks);
+            return (domainCount, addressCount);
         }
 
         /// <summary>
         /// 对单个域名做解析测速，并记录结果
         /// </summary>
+        /// <param name="onDomainTested">该域名参与测速后回调（并发计数用）</param>
+        /// <param name="onAddressCount">回报该域名测速后的可用IP数（并发计数用）</param>
         private async Task TestSpeedOneAsync(
             DnsEndPoint dnsEndPoint,
             IPAddress[] oldAddresses,
             bool hostsOnly,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            Func<int> onDomainTested,
+            Action<int> onAddressCount)
         {
             try
             {
@@ -185,6 +197,8 @@ namespace FastGithub.DomainResolve
             {
                 var newAddresses = await this.addressService.GetAddressesAsync(dnsEndPoint, oldAddresses, hostsOnly, cancellationToken);
                 this.dnsEndPointAddress[dnsEndPoint] = newAddresses;
+                onAddressCount(newAddresses.Length);
+                onDomainTested();
 
                 var oldSegmentums = oldAddresses.Take(MAX_IP_COUNT);
                 var newSegmentums = newAddresses.Take(MAX_IP_COUNT);
@@ -213,8 +227,8 @@ namespace FastGithub.DomainResolve
         /// 刷新所有域名的IP（清空缓存并重新解析测速）
         /// </summary>
         /// <param name="cancellationToken"></param>
-        /// <returns></returns>
-        public async Task RefreshAsync(CancellationToken cancellationToken = default)
+        /// <returns>刷新结果</returns>
+        public async Task<RefreshIpResult> RefreshAsync(CancellationToken cancellationToken = default)
         {
             this.logger.LogInformation("触发IP刷新：重新解析测速（保留探测缓存，避免失败时全量重探）");
 
@@ -239,8 +253,16 @@ namespace FastGithub.DomainResolve
             // 这里只清 DNS/DoH 的解析结果（换IP 的来源），不动探测缓存（避免探测风暴）。
             this.dnsClient.InvalidateCache();
 
-            await this.TestSpeedAsync(hostsOnly: false, cancellationToken);
-            await this.hostsService.RefreshAsync(cancellationToken);
+            var (domainCount, addressCount) = await this.TestSpeedAsync(hostsOnly: false, cancellationToken);
+            var hosts = await this.hostsService.RefreshAsync(cancellationToken);
+            return new RefreshIpResult
+            {
+                DomainCount = domainCount,
+                AddressCount = addressCount,
+                HostsUpdated = hosts.Success,
+                HostsDomainCount = hosts.DomainCount,
+                HostsError = hosts.Error,
+            };
         }
 
         /// <summary>
@@ -328,16 +350,24 @@ namespace FastGithub.DomainResolve
         /// 刷新所有域名的IP（仅使用在线hosts源，不发起DNS查询）
         /// </summary>
         /// <param name="cancellationToken"></param>
-        /// <returns></returns>
-        public async Task RefreshHostsAsync(CancellationToken cancellationToken = default)
+        /// <returns>刷新结果</returns>
+        public async Task<RefreshIpResult> RefreshHostsAsync(CancellationToken cancellationToken = default)
         {
             this.logger.LogInformation("手动触发IP刷新：仅使用在线hosts源");
             this.addressService.ClearCache();
 
             // 【v2.6.6 P1-2】force=true：用户显式点击"刷新"，必须真的去拉一次源，
             // 不能被后台 5 分钟节流挡成"点了没反应"。
-            await this.hostsService.RefreshAsync(cancellationToken, force: true);
-            await this.TestSpeedAsync(hostsOnly: true, cancellationToken);
+            var hosts = await this.hostsService.RefreshAsync(cancellationToken, force: true);
+            var (domainCount, addressCount) = await this.TestSpeedAsync(hostsOnly: true, cancellationToken);
+            return new RefreshIpResult
+            {
+                DomainCount = domainCount,
+                AddressCount = addressCount,
+                HostsUpdated = hosts.Success,
+                HostsDomainCount = hosts.DomainCount,
+                HostsError = hosts.Error,
+            };
         }
 
         /// <summary>

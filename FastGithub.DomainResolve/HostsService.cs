@@ -7,11 +7,37 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace FastGithub.DomainResolve
 {
+    /// <summary>
+    /// 在线hosts源刷新结果
+    /// </summary>
+    /// <remarks>
+    /// 【v2.6.11 借鉴上游 v2.3.2】把"刷新成败/域名数/失败原因"带回调用方，
+    /// /refresh-ip 才能给 UI 返回真实结果而不是一句"已触发"。
+    /// </remarks>
+    public sealed class HostsRefreshResult
+    {
+        /// <summary>
+        /// 是否更新成功（节流跳过视为成功：当前映射可用）
+        /// </summary>
+        public bool Success { get; init; }
+
+        /// <summary>
+        /// hosts源包含的域名数量（失败时为上次成功拉取的数量）
+        /// </summary>
+        public int DomainCount { get; init; }
+
+        /// <summary>
+        /// 更新失败/被跳过的原因（成功时为 null）
+        /// </summary>
+        public string? Error { get; init; }
+    }
+
     /// <summary>
     /// 在线hosts源解析服务
     /// 定时从远程hosts地址拉取“域名->IP”映射，作为DNS解析之外的额外候选IP来源
@@ -118,10 +144,10 @@ namespace FastGithub.DomainResolve
         /// 是否忽略成功节流与失败退避。
         /// <para>用于 UI 上的「手动刷新」：那是用户显式动作，
         /// 语义上必须"现在就去拉"，不能被后台节流挡住；
-        /// 否则用户点��刷新却毫无反应，会被当成程序卡死。</para>
+        /// 否则用户点了刷新却毫无反应，会被当成程序卡死。</para>
         /// </param>
-        /// <returns></returns>
-        public async Task RefreshAsync(CancellationToken cancellationToken, bool force = false)
+        /// <returns>刷新结果（成功与否、域名数、失败原因）</returns>
+        public async Task<HostsRefreshResult> RefreshAsync(CancellationToken cancellationToken, bool force = false)
         {
             var hostsUrl = this.options.CurrentValue.HostsUrl?.Trim();
             if (string.IsNullOrEmpty(hostsUrl))
@@ -131,7 +157,7 @@ namespace FastGithub.DomainResolve
                 {
                     this.mapping.Clear();
                 }
-                return;
+                return new HostsRefreshResult { Success = false, DomainCount = 0, Error = "在线hosts源已禁用（HostsUrl 未配置）" };
             }
 
             // 【v2.6.6 P1-2】全局节流：成功拉取的内容等价，5 分钟内的重复请求一律跳过。
@@ -141,14 +167,14 @@ namespace FastGithub.DomainResolve
                 this.lastSuccessAt != DateTime.MinValue &&
                 DateTime.UtcNow - this.lastSuccessAt < successRefreshInterval)
             {
-                return;
+                return new HostsRefreshResult { Success = true, DomainCount = this.mapping.Count };
             }
 
             // 合流：并发进入者等待首个请求的结果，而不是各自发一次。
             if (await this.refreshGate.WaitAsync(TimeSpan.FromSeconds(5d), cancellationToken) == false)
             {
                 this.logger.LogDebug("在线hosts源刷新正在进行中，本次跳过");
-                return;
+                return new HostsRefreshResult { Success = true, DomainCount = this.mapping.Count };
             }
 
             try
@@ -158,7 +184,7 @@ namespace FastGithub.DomainResolve
                     this.lastSuccessAt != DateTime.MinValue &&
                     DateTime.UtcNow - this.lastSuccessAt < successRefreshInterval)
                 {
-                    return;
+                    return new HostsRefreshResult { Success = true, DomainCount = this.mapping.Count };
                 }
 
                 // 失败退避：连续失败越多，等得越久（指数增长，封顶 2h）。
@@ -172,7 +198,7 @@ namespace FastGithub.DomainResolve
                         this.logger.LogDebug(
                             $"在线hosts源处于失败退避中（已连续失败 {this.consecutiveFailures} 次，" +
                             $"{(wait - elapsed).TotalMinutes:F1} 分钟后重试），本次跳过");
-                        return;
+                        return new HostsRefreshResult { Success = true, DomainCount = this.mapping.Count };
                     }
                 }
 
@@ -211,11 +237,14 @@ namespace FastGithub.DomainResolve
                         "私有网段或已知污染地址）已被丢弃。这类地址若被当作候选会把请求导向本机或错误目标。" +
                         "如持续出现，说明该源已被污染，建议更换（FastGithub:HostsUrl）。");
                 }
+
+                return new HostsRefreshResult { Success = true, DomainCount = this.mapping.Count };
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
                 // 整体停机：不是源的问题，不计失败、不告警。
                 this.logger.LogDebug("在线hosts源刷新因程序停止而取消");
+                return new HostsRefreshResult { Success = false, DomainCount = this.mapping.Count, Error = "刷新已取消" };
             }
             catch (Exception ex)
             {
@@ -236,6 +265,8 @@ namespace FastGithub.DomainResolve
                         "请确认该域名仍由可信方长期维护；" +
                         "如需更换或禁用，可在 appsettings.json 中设置 FastGithub:HostsUrl。");
                 }
+
+                return new HostsRefreshResult { Success = false, DomainCount = this.mapping.Count, Error = ex.Message };
             }
             finally
             {
@@ -276,12 +307,96 @@ namespace FastGithub.DomainResolve
         }
 
         /// <summary>
+        /// 解析hosts源内容，自动识别 JSON 数组与 hosts 文本两种格式
+        /// </summary>
+        /// <remarks>
+        /// 【v2.6.11 借鉴上游 v2.3.2】上游默认源已切换为
+        /// https://raw.hellogithub.com/hosts.json（[["ip","domain"],...] 数组格式）。
+        /// 本实现此前只解析文本格式：一旦源格式迁移，hosts 通道会静默失效
+        /// （有"失败保留旧映射"保护不至于清空，但通道就此报废）。
+        /// 识别规则与上游一致：内容以 '[' 或 '{' 开头按 JSON 解析，否则按文本解析。
+        /// </remarks>
+        /// <param name="content">hosts源内容</param>
+        /// <param name="invalidCount">被丢弃的无效IP 数量（环回/内网/污染段）</param>
+        /// <returns>域名->IP映射</returns>
+        private static Dictionary<string, IReadOnlyList<IPAddress>> Parse(string content, out int invalidCount)
+        {
+            var trimmed = content.TrimStart();
+            return trimmed.StartsWith('[') || trimmed.StartsWith('{')
+                ? ParseJson(content, out invalidCount)
+                : ParseText(content, out invalidCount);
+        }
+
+        /// <summary>
+        /// 解析 JSON 格式：[["ip","domain"],...]
+        /// </summary>
+        /// <param name="content"></param>
+        /// <param name="invalidCount">被丢弃的无效IP数量</param>
+        /// <returns>域名->IP映射</returns>
+        private static Dictionary<string, IReadOnlyList<IPAddress>> ParseJson(string content, out int invalidCount)
+        {
+            invalidCount = 0;
+            var map = new Dictionary<string, List<IPAddress>>();
+            try
+            {
+                var items = JsonSerializer.Deserialize<string[][]>(content);
+                if (items == null)
+                {
+                    return map.ToDictionary(item => item.Key, item => (IReadOnlyList<IPAddress>)item.Value);
+                }
+
+                foreach (var item in items)
+                {
+                    if (item == null || item.Length < 2)
+                    {
+                        continue;
+                    }
+
+                    if (IPAddress.TryParse(item[0], out var ip) == false)
+                    {
+                        continue;
+                    }
+
+                    // 与文本格式共用同一套无效IP过滤：JSON 源同样可能被投毒，
+                    // 环回/内网/污染地址一旦入选会把请求导向本机或错误目标。
+                    if (IpAddressFilter.IsInvalid(ip))
+                    {
+                        invalidCount++;
+                        continue;
+                    }
+
+                    var host = item[1].Trim().ToLowerInvariant();
+                    if (host.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    if (map.TryGetValue(host, out var list) == false)
+                    {
+                        list = new List<IPAddress>();
+                        map[host] = list;
+                    }
+
+                    if (list.Contains(ip) == false)
+                    {
+                        list.Add(ip);
+                    }
+                }
+            }
+            catch (JsonException)
+            {
+                // 解析失败按"空映射"处理：调用方保留旧映射并告警，不会清空已有数据。
+            }
+            return map.ToDictionary(item => item.Key, item => (IReadOnlyList<IPAddress>)item.Value);
+        }
+
+        /// <summary>
         /// 解析hosts文本内容
         /// </summary>
         /// <param name="content">hosts文本</param>
         /// <param name="invalidCount">被丢弃的无效IP 数量（环回/内网/污染段）</param>
         /// <returns>域名->IP映射</returns>
-        private static Dictionary<string, IReadOnlyList<IPAddress>> Parse(string content, out int invalidCount)
+        private static Dictionary<string, IReadOnlyList<IPAddress>> ParseText(string content, out int invalidCount)
         {
             var map = new Dictionary<string, List<IPAddress>>();
             invalidCount = 0;

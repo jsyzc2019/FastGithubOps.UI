@@ -86,6 +86,9 @@ namespace FastGithub
             // 等于从未真正执行过。新增自检若不同步注册，同样会重蹈覆辙。
             failed += IpHealthTrackerSelfTest.Run();
 
+            // 【v2.6.11】hosts 源 JSON/文本双格式解析自检
+            failed += HostsSourceSelfTest.Run();
+
             Console.WriteLine(failed == 0
                 ? "=== 自检全部通过 ==="
                 : $"=== 自检失败 {failed} 项 ===");

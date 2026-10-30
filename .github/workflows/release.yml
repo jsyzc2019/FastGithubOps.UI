@@ -64,6 +64,20 @@ jobs:
       with:
         dotnet-version: '10.0.x'
 
+    # 【v2.6.11】华为云镜像在 runner 上 nupkg 下载损坏，CI 内覆盖为 nuget.org
+    - name: Use nuget.org feed (Huawei mirror is broken on runners)
+      shell: bash
+      run: |
+        cat > NuGet.config << 'EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <configuration>
+          <packageSources>
+            <clear />
+            <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
+          </packageSources>
+        </configuration>
+        EOF
+
     - name: Publish main program
       run: |
         dotnet publish FastGithub/FastGithub.csproj `
@@ -153,7 +167,14 @@ jobs:
     - name: Generate release notes
       shell: bash
       run: |
-        cat > release_notes.md << 'EOF'
+        version="${{ github.event.inputs.version }}"
+        # 【v2.6.11】优先使用仓库内维护的 release-notes/<tag>.md 作为单一事实来源；
+        # 不存在时回退到通用模板。
+        if [ -f "release-notes/${version}.md" ]; then
+          cp "release-notes/${version}.md" release_notes.md
+          echo "使用 release-notes/${version}.md 作为发布说明"
+        else
+          cat > release_notes.md << 'EOF'
         ## FastGithub ${{ github.event.inputs.version }}
 
         ### 下载说明
@@ -168,11 +189,8 @@ jobs:
         - 透明拦截依赖 WinDivert，需要管理员权限；若被安全软件拦截，
           程序会自动降级到正向代理模式（仍可用）
         - 详细配置请查看 [README.md](https://github.com/${{ github.repository }}/blob/main/README.md)
-
-        ---
-
-        **完整更新日志**: https://github.com/${{ github.repository }}/compare/$(git describe --tags --abbrev=0 HEAD^)...${{ github.event.inputs.version }}
-        EOF
+          EOF
+        fi
 
     - name: Create GitHub Release
       uses: softprops/action-gh-release@v1

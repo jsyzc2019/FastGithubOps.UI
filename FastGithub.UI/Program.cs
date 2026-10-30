@@ -40,6 +40,12 @@ namespace FastGithub.UI
             SetWebBrowserVersion();
 
             var app = new Application();
+            // 【v2.6.11 借鉴上游 v2.3.2】兜底未处理异常：上游实证过
+            // "日志页右键复制时剪贴板被占用 -> COMException -> 托盘进程崩溃
+            //  -> 后端随父进程退出 -> 加速静默失效" 的完整故障链。
+            // UI 是后端的父进程，UI 活着才有加速；未处理异常一律吞掉继续跑。
+            app.DispatcherUnhandledException += (s, e) => e.Handled = true;
+            AppDomain.CurrentDomain.UnhandledException += (s, e) => { };
             app.StartupUri = new Uri(MAIN_WINDOWS, UriKind.Relative);
             app.Run();
         }
