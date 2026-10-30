@@ -170,28 +170,28 @@ jobs:
         version="${{ github.event.inputs.version }}"
         # 【v2.6.11】优先使用仓库内维护的 release-notes/<tag>.md 作为单一事实来源；
         # 不存在时回退到通用模板。
-        # 注意：heredoc 结束符 EOF 必须顶格（bash 不认缩进的结束符），
-        # 此前写在 else 分支内带缩进导致 here-document 吞到脚本尾，整步语法错误。
+        # 注意：不要用 heredoc——bash 要求结束符顶格，而 YAML 块标量里列 0 的
+        # 内容行会破坏文件结构（两次 CI 实测踩坑）。改用 echo 拼接。
         if [ -f "release-notes/${version}.md" ]; then
           cp "release-notes/${version}.md" release_notes.md
           echo "使用 release-notes/${version}.md 作为发布说明"
         else
-          cat > release_notes.md << 'EOF'
-## FastGithub ${{ github.event.inputs.version }}
-
-### 下载说明
-- 下载 `fastgithub-win-x64.zip`，解压后运行 `FastGithub.UI.exe`
-- 首次使用需要安装并信任 CA 证书（请以管理员身份运行，程序会自动导入）
-
-### 校验
-- 用 `fastgithub-win-x64.sha256` 核对 `fastgithub.exe` 与 `FastGithub.UI.exe`
-
-### 注意事项
-- 仅提供 win-x64 版本
-- 透明拦截依赖 WinDivert，需要管理员权限；若被安全软件拦截，
-  程序会自动降级到正向代理模式（仍可用）
-- 详细配置请查看 [README.md](https://github.com/${{ github.repository }}/blob/main/README.md)
-EOF
+          {
+            echo '## FastGithub ${{ github.event.inputs.version }}'
+            echo ''
+            echo '### 下载说明'
+            echo '- 下载 `fastgithub-win-x64.zip`，解压后运行 `FastGithub.UI.exe`'
+            echo '- 首次使用需要安装并信任 CA 证书（请以管理员身份运行，程序会自动导入）'
+            echo ''
+            echo '### 校验'
+            echo '- 用 `fastgithub-win-x64.sha256` 核对 `fastgithub.exe` 与 `FastGithub.UI.exe`'
+            echo ''
+            echo '### 注意事项'
+            echo '- 仅提供 win-x64 版本'
+            echo '- 透明拦截依赖 WinDivert，需要管理员权限；若被安全软件拦截，'
+            echo '  程序会自动降级到正向代理模式（仍可用）'
+            echo '- 详细配置请查看 [README.md](https://github.com/${{ github.repository }}/blob/main/README.md)'
+          } > release_notes.md
         fi
 
     - name: Create GitHub Release
