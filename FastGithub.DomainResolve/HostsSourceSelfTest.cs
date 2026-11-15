@@ -59,9 +59,9 @@ namespace FastGithub.DomainResolve
             }
 
             var args = new object[] { content, 0 };
-            var result = (Dictionary<string, IReadOnlyList<IPAddress>>)method.Invoke(null, args);
+            var result = method.Invoke(null, args) as Dictionary<string, IReadOnlyList<IPAddress>>;
             invalidCount = (int)args[1];
-            return result;
+            return result ?? throw new InvalidOperationException("HostsService.Parse 返回值类型异常");
         }
 
         /// <summary>
