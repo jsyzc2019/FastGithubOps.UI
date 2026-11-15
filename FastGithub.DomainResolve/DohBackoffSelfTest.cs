@@ -15,6 +15,12 @@ namespace FastGithub.DomainResolve
     /// 而短时测试永远复现不出来（网络好时两个机制都不会被触发）。
     /// 因此这里用反射直接驱动私有方法做**确定性**验证，不依赖真实网络。
     /// </para>
+    /// <para>
+    /// 【v2.6.14】<c>ReportEndpointResult</c> 新增第三个参数 <c>slowFailure</c>
+    /// （默认 false）。反射调用**必须显式传满三个参数** ——
+    /// <c>MethodBase.Invoke</c> 不会自动填充可选参数，少传会抛
+    /// <c>TargetParameterCountException</c>。
+    /// </para>
     /// </summary>
     public static class DohBackoffSelfTest
     {
@@ -141,7 +147,7 @@ namespace FastGithub.DomainResolve
                 var thread = new Thread(() =>
                 {
                     barrier.SignalAndWait();
-                    report.Invoke(resolver, new object[] { endpoint, false });
+                    report.Invoke(resolver, new object[] { endpoint, false, false });
                 });
                 threads.Add(thread);
                 thread.Start();
@@ -175,7 +181,7 @@ namespace FastGithub.DomainResolve
             // 连续失败达到阈值（4 次）→ 熔断
             for (var i = 0; i < 4; i++)
             {
-                report.Invoke(resolver, new object[] { endpoint, false });
+                report.Invoke(resolver, new object[] { endpoint, false, false });
             }
 
             var first = GetEndpointState(resolver, endpoint);
@@ -184,7 +190,7 @@ namespace FastGithub.DomainResolve
             // 熔断期内再失败 10 次，剩余冷却时间不得被拉长
             for (var i = 0; i < 10; i++)
             {
-                report.Invoke(resolver, new object[] { endpoint, false });
+                report.Invoke(resolver, new object[] { endpoint, false, false });
             }
 
             var second = GetEndpointState(resolver, endpoint);
@@ -406,7 +412,7 @@ namespace FastGithub.DomainResolve
             var before = (TimeSpan)getTimeout.Invoke(resolver, new object[] { endpoint })!;
 
             // 上报成功（这是每轮竞速赢家的必经路径）
-            reportResult.Invoke(resolver, new object[] { endpoint, true });
+            reportResult.Invoke(resolver, new object[] { endpoint, true, false });
             var after = (TimeSpan)getTimeout.Invoke(resolver, new object[] { endpoint })!;
 
             Assert(after == before,
@@ -417,8 +423,8 @@ namespace FastGithub.DomainResolve
                 $"实际 {after.TotalSeconds:F1}s");
 
             // 同时验证熔断计数确实被清零（该职责不能因为上面的修改而失效）
-            reportResult.Invoke(resolver, new object[] { endpoint, false });
-            reportResult.Invoke(resolver, new object[] { endpoint, true });
+            reportResult.Invoke(resolver, new object[] { endpoint, false, false });
+            reportResult.Invoke(resolver, new object[] { endpoint, true, false });
             var (failures, blockedUntil) = GetEndpointState(resolver, endpoint);
             Assert(failures == 0 && blockedUntil == DateTime.MinValue,
                 "成功上报后熔断计数确实清零",
@@ -478,7 +484,7 @@ namespace FastGithub.DomainResolve
             // 连续失败达到阈值（4 次）→ 熔断
             for (var i = 0; i < 4; i++)
             {
-                report.Invoke(resolver, new object[] { endpoint, false });
+                report.Invoke(resolver, new object[] { endpoint, false, false });
             }
 
             var (failures, blockedUntil) = GetEndpointState(resolver, endpoint);
@@ -507,7 +513,7 @@ namespace FastGithub.DomainResolve
             Assert(second, "半开期间第二个请求被挡住（避免并发洪峰）");
 
             // 试探成功 → 端点完全恢复，后续请求全部正常放行
-            report.Invoke(resolver, new object[] { endpoint, true });
+            report.Invoke(resolver, new object[] { endpoint, true, false });
             Assert((bool)isBlocked.Invoke(resolver, new object[] { endpoint })! == false,
                 "半开试探成功后端点恢复正常放行");
             Assert((bool)isBlocked.Invoke(resolver, new object[] { endpoint })! == false,
@@ -552,7 +558,7 @@ namespace FastGithub.DomainResolve
                 // 本轮：连续失败 4 次 → 触发熔断
                 for (var i = 0; i < 4; i++)
                 {
-                    report.Invoke(resolver, new object[] { endpoint, false });
+                    report.Invoke(resolver, new object[] { endpoint, false, false });
                 }
 
                 var blockedUntil = GetEndpointState(resolver, endpoint).BlockedUntil;
@@ -571,7 +577,7 @@ namespace FastGithub.DomainResolve
 
                 // 关键：一次**普通成功**（非半开试探）。
                 // 端点本来就在正常服务、这次恰好成功，不构成"恢复"。
-                report.Invoke(resolver, new object[] { endpoint, true });
+                report.Invoke(resolver, new object[] { endpoint, true, false });
             }
 
             // 递增必须真实发生：每一轮的熔断时长都要比上一轮更长
@@ -608,12 +614,12 @@ namespace FastGithub.DomainResolve
             {
                 for (var i = 0; i < 4; i++)
                 {
-                    report.Invoke(resolver, new object[] { endpoint, false });
+                    report.Invoke(resolver, new object[] { endpoint, false, false });
                 }
                 var st = GetEndpointStateObject(resolver, endpoint);
                 if (st == null) { failed++; return; }
                 st.GetType().GetField("BlockedUntil")!.SetValue(st, DateTime.UtcNow.AddSeconds(-1d));
-                report.Invoke(resolver, new object[] { endpoint, true });
+                report.Invoke(resolver, new object[] { endpoint, true, false });
             }
 
             // 此刻应处于"第 2 次熔断"的冷却档（普通成功没有清零它）
@@ -625,7 +631,7 @@ namespace FastGithub.DomainResolve
             st2.GetType().GetField("BlockedUntil")!.SetValue(st2, DateTime.UtcNow.AddSeconds(-1d));
             var probe = (bool)isBlocked.Invoke(resolver, new object[] { endpoint })!;
             Assert(probe == false, "冷却到期后放行半开试探请求");
-            report.Invoke(resolver, new object[] { endpoint, true });
+            report.Invoke(resolver, new object[] { endpoint, true, false });
 
             var st3 = GetEndpointStateObject(resolver, endpoint)!;
             var blocksAfter = (int)st3.GetType().GetField("ConsecutiveBlocks")!.GetValue(st3)!;

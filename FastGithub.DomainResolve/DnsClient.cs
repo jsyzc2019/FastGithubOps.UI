@@ -67,15 +67,37 @@ namespace FastGithub.DomainResolve
         private static readonly TimeSpan tcpConnectTimeout = TimeSpan.FromSeconds(2d);
 
         /// <summary>
-        /// 明文 DNS "假可达"的冷却时长。TCP 通但查询被 RST 属网络环境特性，
+        /// 明文 DNS "假可达"的冷却时长。TCP 通但查询被 RST / 被回 REFUSED 属网络环境特性，
         /// 短时间内无需再试；取 10 分钟与 DoH 正缓存同量级，也与端点熔断周期一致。
         /// </summary>
         private static readonly TimeSpan plainDnsBrokenCooldown = TimeSpan.FromMinutes(10d);
 
         /// <summary>
-        /// 记录 (dns, 域名) 维度上"TCP 可达但查询被对端截断"，值为冷却截止时刻。
+        /// 【v2.6.14 P1】明文 DNS 冷却的递增上限。
+        /// <para>
+        /// 本机环境里明文 53 是**结构性不可用**（10-31~11-15 每天的失败率都是 100%），
+        /// 固定 10 分钟冷却等于每 10 分钟白白重试一次、再记一条日志：两个 DNS 服务器
+        /// 一天就是 288 次无效查询。递增到 30 分钟封顶后降到约 96 次/天，
+        /// 而且一旦网络恢复，第一次成功查询就会清零（见 <see cref="ReportPlainDnsHealthy"/>）。
+        /// </para>
         /// </summary>
-        private readonly ConcurrentDictionary<string, DateTime> plainDnsBroken = new();
+        private static readonly TimeSpan plainDnsBrokenCooldownMax = TimeSpan.FromMinutes(30d);
+
+        /// <summary>
+        /// 记录明文 DNS 服务器维度上"TCP 可达但查询失败"，值为(冷却截止时刻, 连续失效次数)。
+        /// </summary>
+        private readonly ConcurrentDictionary<string, (DateTime Until, int Failures)> plainDnsBroken = new();
+
+        /// <summary>
+        /// 【v2.6.14 P1】明文 DNS 查询的独立超时（A + AAAA 合计）。
+        /// <para>
+        /// 本机实测：对**任意** IP（包括 192.0.2.1 这种不可路由地址）的 53/tcp 握手
+        /// 都能在 0.01 秒"成功"—— 握手被中间盒伪造，随后查询要么回 REFUSED，
+        /// 要么干脆不回应答。不设超时的话，后者会一直挂到上层请求预算耗尽（25s），
+        /// 于是"DNS 超时"表现为"页面整体超时"。
+        /// </para>
+        /// </summary>
+        private static readonly TimeSpan plainDnsLookupTimeout = TimeSpan.FromSeconds(4d);
 
         private record LookupResult(IList<IPAddress> Addresses, TimeSpan TimeToLive);
 
@@ -250,35 +272,66 @@ namespace FastGithub.DomainResolve
         private bool ShouldSkipPlainDns(IPEndPoint dns, string host)
         {
             var key = dns.ToString();
-            if (this.plainDnsBroken.TryGetValue(key, out var until))
+            if (this.plainDnsBroken.TryGetValue(key, out var state) && state.Until > DateTime.UtcNow)
             {
-                if (until > DateTime.UtcNow)
-                {
-                    return true;
-                }
-                this.plainDnsBroken.TryRemove(key, out _);
+                return true;
             }
             return false;
         }
 
         /// <summary>
-        /// 标记某明文 DNS 服务器的查询被对端 RST/截断，进入冷却
+        /// 标记某明文 DNS 服务器的查询被对端拒绝（REFUSED/RST）或无应答，进入递增冷却。
+        /// <para>
+        /// 【v2.6.14 P1】只有**状态真正发生变化**时才返回 true，调用方据此决定是否记一条日志。
+        /// 旧实现每条失败查询都 <c>LogWarning</c>：11-15 单日 7,979 条同文案告警（占全部日志 50%），
+        /// 把真正的错误彻底淹没，而这些告警反映的是**环境属性**（明文 53 全被封），
+        /// 用户侧经验完全正常。
+        /// </para>
         /// </summary>
-        private void ReportPlainDnsBroken(IPEndPoint dns, string host, bool broken)
+        /// <returns>本次是否"新进入/重新进入"冷却</returns>
+        private bool ReportPlainDnsBroken(IPEndPoint dns, string host)
         {
-            if (broken == false)
-            {
-                return;
-            }
-
             var key = dns.ToString();
-            if (this.plainDnsBroken.TryGetValue(key, out var until) && until > DateTime.UtcNow)
-            {
-                // 已在冷却中，不延长剩余时长
-                return;
-            }
+            var now = DateTime.UtcNow;
+            var newlyBroken = false;
 
-            this.plainDnsBroken[key] = DateTime.UtcNow.Add(plainDnsBrokenCooldown);
+            this.plainDnsBroken.AddOrUpdate(
+                key,
+                _ =>
+                {
+                    newlyBroken = true;
+                    return (now + plainDnsBrokenCooldown, 1);
+                },
+                (_, old) =>
+                {
+                    // 已在冷却中：不延长剩余时长，也不重复计数
+                    if (old.Until > now)
+                    {
+                        return old;
+                    }
+
+                    var failures = old.Failures + 1;
+                    var shift = Math.Min(failures - 1, 10);
+                    var seconds = Math.Min(
+                        plainDnsBrokenCooldown.TotalSeconds * (1 << shift),
+                        plainDnsBrokenCooldownMax.TotalSeconds);
+                    newlyBroken = true;
+                    return (now + TimeSpan.FromSeconds(seconds), failures);
+                });
+
+            return newlyBroken;
+        }
+
+        /// <summary>
+        /// 【v2.6.14 P1】明文 DNS 查询成功：清除冷却与递增计数（网络恢复的唯一证据）。
+        /// </summary>
+        /// <param name="dns"></param>
+        private void ReportPlainDnsHealthy(IPEndPoint dns)
+        {
+            if (this.plainDnsBroken.IsEmpty == false)
+            {
+                this.plainDnsBroken.TryRemove(dns.ToString(), out _);
+            }
         }
 
         /// <summary>
@@ -343,6 +396,12 @@ namespace FastGithub.DomainResolve
                     return value;
                 }
                 var result = await this.LookupCoreAsync(dns, endPoint, fastSort, cancellationToken);
+
+                // 【v2.6.14 P1】明文 DNS 真的答出来了：这是网络恢复的唯一证据，清掉冷却与递增计数
+                if (dns.Port == DNS_PORT && result.Addresses.Count > 0)
+                {
+                    this.ReportPlainDnsHealthy(dns);
+                }
                 return this.dnsLookupCache.Set(key, result.Addresses, result.TimeToLive);
             }
             catch (OperationCanceledException)
@@ -351,15 +410,23 @@ namespace FastGithub.DomainResolve
             }
             catch (Exception ex)
             {
-                this.logger.LogWarning($"{endPoint.Host}@{dns}->{ex.Message}");
-
-                // 区分"这次查询失败"与"这个 DNS 根本不可用"：
-                // TCP 握手此前已成功（IsDnsAvailableAsync 判定可用），却在这一步被 RST /
-                // 意外断流，属于该网络下明文 53 端口的典型封锁特征，值得记住并跳过后续查询；
-                // 而 OperationCanceledException（超时取消）只是慢，不应判定为被封锁。
-                if (dns.Port == DNS_PORT && IsBlockedByPeer(ex))
+                // 【v2.6.14 P1】明文 DNS 失败不再逐条告警。
+                // 本网络下明文 53 是 100% 失败的结构性属性（TCP 握手被中间盒伪造，
+                // 查询回 REFUSED 或干脆无应答），逐条 LogWarning 单日产出 7,979 条，
+                // 占全部日志的一半，把真正的错误彻底淹没。
+                // 改为"状态变化时记一条 Information"：既能看见环境事实，又不再淹没日志。
+                var blocked = dns.Port == DNS_PORT && IsPlainDnsUnusable(ex);
+                if (blocked)
                 {
-                    this.ReportPlainDnsBroken(dns, endPoint.Host, broken: true);
+                    if (this.ReportPlainDnsBroken(dns, endPoint.Host))
+                    {
+                        this.logger.LogInformation(
+                            $"明文DNS {dns} 查询被拒绝或无应答（{ex.Message}），已临时跳过该服务器，改用 DoH 解析");
+                    }
+                }
+                else
+                {
+                    this.logger.LogDebug($"{endPoint.Host}@{dns}->{ex.Message}");
                 }
 
                 var expiration = IsSocketException(ex) ? this.maxTimeToLive : this.minTimeToLive;
@@ -388,6 +455,23 @@ namespace FastGithub.DomainResolve
         }
 
         /// <summary>
+        /// 【v2.6.14 P1】该明文 DNS 是否已被证明不可用（拒绝服务 或 无应答）。
+        /// </summary>
+        /// <param name="ex"></param>
+        /// <returns></returns>
+        private static bool IsPlainDnsUnusable(Exception ex)
+        {
+            // 独立预算到点 = 无应答。本机 53/tcp 的"握手成功"是中间盒伪造的，
+            // 因此"能连上但不回答"同样是"该服务器不可用"，必须进冷却，
+            // 否则每个域名都要白等一次完整预算。
+            if (ex is TimeoutException)
+            {
+                return true;
+            }
+            return IsBlockedByPeer(ex);
+        }
+
+        /// <summary>
         /// 判断异常是否为"对端主动截断连接"（RST / 意外断流）而非本地超时。
         /// <para>
         /// 这类异常说明链路本身通（能收到 TCP RST 或半包后被断开），
@@ -397,10 +481,23 @@ namespace FastGithub.DomainResolve
         /// </summary>
         private static bool IsBlockedByPeer(Exception ex)
         {
-            // 超时取消属于"慢"，不判定为被封锁
+            // 超时取消属于"慢"，不判定为被封锁（明文 DNS 的独立超时由 IsPlainDnsUnusable 处理）
             if (ex is OperationCanceledException || ex is TimeoutException)
             {
                 return false;
+            }
+
+            // 【v2.6.14 P1】服务器**答了**但拒绝服务（REFUSED / SERVFAIL / NOTIMP）。
+            // 旧实现只认 SocketException 与 IOException，ResponseException 被完全漏过，
+            // 于是 plainDnsBroken 冷却从未触发过：同一台 DNS 对每个域名都要重试一次，
+            // 单日 7,979 条 Refused 告警、约 1,500 次无效 TCP 建连（11-15 实测）。
+            // 注意 NXDOMAIN(NameError) 是正常应答，绝不能算封锁。
+            if (ex is ResponseException responseException)
+            {
+                var responseCode = responseException.Response?.ResponseCode;
+                return responseCode == ResponseCode.Refused
+                    || responseCode == ResponseCode.ServerFailure
+                    || responseCode == ResponseCode.NotImplemented;
             }
 
             if (ex is SocketException socketException)
@@ -457,7 +554,32 @@ namespace FastGithub.DomainResolve
                 ? (IRequestResolver)new TcpRequestResolver(dns)
                 : new UdpRequestResolver(dns, new TcpRequestResolver(dns), this.resolveTimeout);
 
-            var addressRecords = await GetAddressRecordsAsync(resolver, endPoint.Host, cancellationToken);
+            // 【v2.6.14 P1】明文 DNS 必须有**独立**的查询超时。
+            // DNS 库的 TcpRequestResolver 自身没有任何超时，而本网络下 53/tcp 的握手
+            // 是中间盒伪造的（对 192.0.2.1 也能 0.01s 连上），之后查询可能永远不回应答 ——
+            // 于是这一步会一直挂到上层请求预算（25s）耗尽，表现为"页面整体超时"。
+            // 这里用 4s（A + AAAA）封顶，超时即抛 TimeoutException 交给上层判为"该 DNS 不可用"。
+            using var plainDnsTimeoutSource = dns.Port == DNS_PORT
+                ? new CancellationTokenSource(plainDnsLookupTimeout)
+                : null;
+            using var plainDnsLinkedSource = plainDnsTimeoutSource != null
+                ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, plainDnsTimeoutSource.Token)
+                : null;
+
+            IList<IPAddressResourceRecord> addressRecords;
+            try
+            {
+                addressRecords = await GetAddressRecordsAsync(
+                    resolver,
+                    endPoint.Host,
+                    plainDnsLinkedSource?.Token ?? cancellationToken);
+            }
+            catch (OperationCanceledException) when (
+                plainDnsTimeoutSource?.IsCancellationRequested == true &&
+                cancellationToken.IsCancellationRequested == false)
+            {
+                throw new TimeoutException($"{plainDnsLookupTimeout.TotalSeconds:F0}s 内无应答");
+            }
 
             // 过滤掉环回地址、内网/保留地址以及已知的DNS污染地址：
             // 污染地址往往"握手很快"，不过滤就会被稳定选中、稳定失败

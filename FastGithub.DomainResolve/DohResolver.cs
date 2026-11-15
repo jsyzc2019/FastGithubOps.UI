@@ -93,6 +93,73 @@ namespace FastGithub.DomainResolve
         private const int endpointFailureThreshold = 4;
 
         /// <summary>
+        /// 【v2.6.14 P0】端点失败计数的去抖窗口（仅作用于"超时类"失败）。
+        /// <para>
+        /// 阈值 4 原本假设的语义是"连续 4 次**独立**失败"。但一次冷启动解析是
+        /// 3~8 个域名 × A/AAAA 并发打向同一批端点，同批请求会**同时**打满超时预算 ——
+        /// 计数被这批回声刷到阈值，整批端点在几秒内接连熔断
+        /// （11-15 18:20 实测：3 个端点间隔 200ms 熔断，2 个在 11 秒后紧跟）。
+        /// </para>
+        /// <para>
+        /// 取 2 秒：同一批超时在 2 秒内的多次回声只记 1 次；而真正的持续超时故障
+        /// （每轮解析都打满预算）仍会以"每 2 秒 1 次"的速度在 8 秒内累计到阈值，
+        /// 熔断能力没有被削弱。快失败（连接被拒/TLS 错误）不走去抖，见 EvaluateFailure。
+        /// </para>
+        /// </summary>
+        private static readonly TimeSpan endpointFailureDebounce = TimeSpan.FromSeconds(2d);
+
+        /// <summary>
+        /// 【v2.6.14 P0】失败计数的衰减窗口。
+        /// <para>
+        /// 失败是"连续"才有意义。若两次失败相隔超过该窗口（本机空闲时每 60 秒
+        /// 才有一轮解析，中间毫无请求），说明它们是两次独立故障，
+        /// 不该累加成"连续 4 次"把端点判死。
+        /// </para>
+        /// </summary>
+        private static readonly TimeSpan endpointFailureDecay = TimeSpan.FromMinutes(3d);
+
+        /// <summary>
+        /// 【v2.6.14 P0】评估一次失败是否应计入熔断计数（纯函数，供自检钉死）。
+        /// <para>
+        /// 只有"打满超时预算"的失败才可能是一次故障的并发回声（同批请求同时超时），
+        /// 因此去抖只作用于这类失败；"快失败"（连接被拒、TLS 错误等）是端点确实在拒绝服务，
+        /// 4 次就是 4 次独立证据，必须立即熔断 —— 否则真死端点要拖 4 分钟才被剔除。
+        /// </para>
+        /// </summary>
+        /// <param name="failures">当前连续失败次数</param>
+        /// <param name="lastFailureUtc">上次计入失败的时刻（<see cref="DateTime.MinValue"/> 表示无）</param>
+        /// <param name="now">本次失败时刻</param>
+        /// <param name="slowFailure">本次失败是否为"超时类"失败</param>
+        /// <returns>是否计入，以及计入后的连续失败次数</returns>
+        internal static (bool Counted, int Failures) EvaluateFailure(int failures, DateTime lastFailureUtc, DateTime now, bool slowFailure)
+        {
+            if (lastFailureUtc == DateTime.MinValue)
+            {
+                return (true, 1);
+            }
+
+            var gap = now - lastFailureUtc;
+            if (gap < TimeSpan.Zero)
+            {
+                gap = TimeSpan.Zero;
+            }
+
+            // 间隔过久：前一段失败序列已经"过期"，本次是新的起点
+            if (gap >= endpointFailureDecay)
+            {
+                return (true, 1);
+            }
+
+            // 去抖窗口内的重复**超时**：同一次故障的并发回声，不计入
+            if (slowFailure && gap < endpointFailureDebounce)
+            {
+                return (false, failures);
+            }
+
+            return (true, failures + 1);
+        }
+
+        /// <summary>
         /// 熔断后的**首次**冷却时长。
         /// <para>
         /// 【v2.6.8】由固定 10 分钟改为"首次 2 分钟 + 每次熔断递增"（见 <see cref="endpointCooldownMax"/>）。
@@ -246,6 +313,11 @@ namespace FastGithub.DomainResolve
         {
             /// <summary>连续失败次数</summary>
             public int Failures;
+
+            /// <summary>
+            /// 【v2.6.14 P0】上次**计入**失败的时刻，用于去抖与衰减。
+            /// </summary>
+            public DateTime LastFailureUtc = DateTime.MinValue;
 
             /// <summary>熔断截止时刻，未熔断时为 <see cref="DateTime.MinValue"/></summary>
             public DateTime BlockedUntil = DateTime.MinValue;
@@ -774,7 +846,7 @@ namespace FastGithub.DomainResolve
         /// 熔断时长按 <see cref="ComputeCooldown"/> 计算，取代原先"每次都固定 10 分钟"。
         /// </para>
         /// </summary>
-        private void ReportEndpointResult(string endpoint, bool success)
+        private void ReportEndpointResult(string endpoint, bool success, bool slowFailure = false)
         {
             var state = this.endpointHealth.GetOrAdd(endpoint, _ => new EndpointState());
             if (success)
@@ -789,6 +861,7 @@ namespace FastGithub.DomainResolve
                     // 与"这次是否成功"无关，不该被一次成功抹掉。
                     shouldPersist = state.BlockedUntil > DateTime.UtcNow || state.Failures > 0;
                     state.Failures = 0;
+                    state.LastFailureUtc = DateTime.MinValue;
                     state.BlockedUntil = DateTime.MinValue;
 
                     // 【v2.6.10 关键修复】成功**不再**无条件清零递增惩罚的计数。
@@ -841,7 +914,17 @@ namespace FastGithub.DomainResolve
                     return;
                 }
 
-                state.Failures++;
+                // 【v2.6.14 P0】去抖 + 衰减后再计数：并发解析对同一端点产生的
+                // 一批失败属于"同一次故障"，只算 1 次（详见 EvaluateFailure）。
+                var now = DateTime.UtcNow;
+                var (counted, failures) = EvaluateFailure(state.Failures, state.LastFailureUtc, now, slowFailure);
+                state.LastFailureUtc = now;
+                if (counted == false)
+                {
+                    return;
+                }
+
+                state.Failures = failures;
                 if (state.Failures >= endpointFailureThreshold)
                 {
                     // 递增冷却：连续熔断次数决定本次时长（2→4→8→16→30 封顶）
@@ -977,6 +1060,8 @@ namespace FastGithub.DomainResolve
             // 若两次尝试共享一个 CancellationTokenSource，第二次启动时剩余预算可能已所剩无几，
             // 等于没有重试。
             const int maxTries = 2;
+            var lastElapsed = TimeSpan.Zero;
+            var lastTimeout = TimeSpan.Zero;
             for (var attempt = 0; attempt < maxTries; attempt++)
             {
                 var timeout = GetTimeoutFor(endpoint);
@@ -992,6 +1077,9 @@ namespace FastGithub.DomainResolve
                     this.ReportEndpointResult(endpoint, success: true);
                     return result;
                 }
+
+                lastElapsed = Stopwatch.GetElapsedTime(startedAt);
+                lastTimeout = timeout;
 
                 // 端点自身超时 = 真实失败，重试一次再判定
                 if (attempt < maxTries - 1 && endpointCts.IsCancellationRequested == false && raceToken.IsCancellationRequested == false)
@@ -1027,7 +1115,10 @@ namespace FastGithub.DomainResolve
 
             // 走到这里说明：端点自身超时（endpointCts 触发）或全部尝试均返回空，
             // 且竞速未结束 —— 这是端点的真实失败，计入熔断计数。
-            this.ReportEndpointResult(endpoint, success: false);
+            // 【v2.6.14 P0】区分"超时类失败"与"快失败"：只有前者可能是同批并发请求
+            // 同时到点的回声（去抖窗口内只算一次），后者是端点真的在拒绝服务。
+            var slowFailure = lastTimeout > TimeSpan.Zero && lastElapsed >= lastTimeout * 0.9d;
+            this.ReportEndpointResult(endpoint, success: false, slowFailure);
             return Array.Empty<IPAddress>();
         }
 

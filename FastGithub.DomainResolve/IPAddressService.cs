@@ -27,6 +27,17 @@ namespace FastGithub.DomainResolve
         private record AddressElapsed(IPAddress Address, TimeSpan Elapsed);
         private readonly TimeSpan problemElapsedExpiration = TimeSpan.FromMinutes(1d);
         private readonly TimeSpan normalElapsedExpiration = TimeSpan.FromMinutes(5d);
+
+        /// <summary>
+        /// 【v2.6.14 P0】启动时装载的"持久化探测结果"有效期。
+        /// <para>
+        /// 取 2 分钟：只用于填补"进程刚起来、还没做任何真实探测"的空窗，
+        /// 让首个请求不必等一轮 15s 建连预算就能拿到候选IP；
+        /// 2 分钟后自然过期，由后台测速用真实探测结果覆盖，
+        /// 避免一份隔夜的旧 RTT 长期压制真实排序。
+        /// </para>
+        /// </summary>
+        private readonly TimeSpan seededElapsedExpiration = TimeSpan.FromMinutes(2d);
         // 默认探测（TCP+TLS）预算。跨境链路 RTT 差异极大：github.com 交互请求常 ~5s，
         // 而 raw/codeload 等大文件域名单条响应曾达 12s+。默认值仅作兜底，
         // 具体域名可用 DomainConfig.ConnectTimeout 覆盖（见 appsettings.github.json）。
@@ -64,6 +75,66 @@ namespace FastGithub.DomainResolve
             (this.domainAddressCache as MemoryCache)?.Compact(1.0);
             (this.addressElapsedCache as MemoryCache)?.Compact(1.0);
         }
+
+        /// <summary>
+        /// 【v2.6.14 P0】用上次运行落盘的候选IP预热缓存。
+        /// <para>
+        /// 两个缓存都必须回填，缺一不可：
+        ///   1) <c>domainAddressCache</c>：<see cref="GetAddressesAsync"/> 只把"解析结果仍在
+        ///      有效期内"的历史IP纳入候选，不回填的话持久化IP会被当场丢掉；
+        ///   2) <c>addressElapsedCache</c>：不回填就会在首个请求路径上对每个候选做一次
+        ///      真实 TCP 探测（单域名最长 15s），等于把启动空窗从"没有IP"换成"有IP但要等探测"。
+        /// </para>
+        /// <para>
+        /// 已存在的缓存项不覆盖：真实探测结果永远优先于落盘的旧值。
+        /// </para>
+        /// </summary>
+        /// <param name="endPoint">域名节点</param>
+        /// <param name="addresses">持久化的候选IP</param>
+        public void Seed(DnsEndPoint endPoint, IReadOnlyList<PersistedAddress> addresses)
+        {
+            foreach (var item in addresses)
+            {
+                if (IpAddressFilter.IsInvalid(item.Address))
+                {
+                    continue;
+                }
+
+                var domainAddress = new DomainAddress(endPoint.Host, item.Address);
+                if (this.domainAddressCache.TryGetValue(domainAddress, out _) == false)
+                {
+                    this.domainAddressCache.Set(domainAddress, default(object), this.domainAddressExpiration);
+                }
+
+                var ipEndPoint = new IPEndPoint(item.Address, endPoint.Port);
+                if (this.addressElapsedCache.TryGetValue<AddressElapsed>(ipEndPoint, out _) == false)
+                {
+                    var elapsed = item.Elapsed <= TimeSpan.Zero ? TimeSpan.FromMilliseconds(1d) : item.Elapsed;
+                    this.addressElapsedCache.Set(ipEndPoint, new AddressElapsed(item.Address, elapsed), this.seededElapsedExpiration);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 【v2.6.14 P0】取某候选IP当前已知的探测耗时，供落盘使用。
+        /// </summary>
+        /// <param name="endPoint">域名节点</param>
+        /// <param name="address">IP</param>
+        /// <param name="elapsed">耗时</param>
+        /// <returns>是否存在有效探测结果</returns>
+        public bool TryGetElapsed(DnsEndPoint endPoint, IPAddress address, out TimeSpan elapsed)
+        {
+            if (this.addressElapsedCache.TryGetValue<AddressElapsed>(new IPEndPoint(address, endPoint.Port), out var item) &&
+                item.Elapsed < TimeSpan.MaxValue)
+            {
+                elapsed = item.Elapsed;
+                return true;
+            }
+
+            elapsed = TimeSpan.Zero;
+            return false;
+        }
+
 
         /// <summary>
         /// 并行获取可连接的IP

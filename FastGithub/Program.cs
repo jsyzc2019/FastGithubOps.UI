@@ -97,6 +97,11 @@ namespace FastGithub
             failed += CandidatePolicySelfTest.Run();
             failed += TlsPolicySelfTest.Run();
 
+            // 【v2.6.14】候选IP 持久化（往返/旧格式/坏文件）、DoH 失败去抖、遥测超时策略
+            failed += PersistenceSelfTest.Run();
+            failed += DohEndpointSelfTest.Run();
+            failed += TelemetryPolicySelfTest.Run();
+
             Console.WriteLine(failed == 0
                 ? "=== 自检全部通过 ==="
                 : $"=== 自检失败 {failed} 项 ===");

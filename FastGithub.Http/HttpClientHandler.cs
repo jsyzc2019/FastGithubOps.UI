@@ -119,8 +119,12 @@ namespace FastGithub.Http
             // 因此配置时不能省略。
             // </para>
             CancellationToken effectiveToken = cancellationToken;
-            using var timeoutTokenSource = this.domainConfig.Timeout != null
-                ? new CancellationTokenSource(this.domainConfig.Timeout.Value)
+            // 【v2.6.14 P1】遥测 beacon 用 8s fail-fast 预算（其余按域名配置）。
+            // 见 TelemetryPolicy：504 里 66% 是 stats/collect beacon，它们吃满 25~30s
+            // 只为上报一条浏览器不等结果的统计，故障时还会放大排队。
+            var requestTimeout = TelemetryPolicy.LimitTimeout(uri, this.domainConfig.Timeout);
+            using var timeoutTokenSource = requestTimeout != null
+                ? new CancellationTokenSource(requestTimeout.Value)
                 : null;
             using var linkedTokenSource = timeoutTokenSource != null
                 ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutTokenSource.Token)

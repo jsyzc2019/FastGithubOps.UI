@@ -129,6 +129,43 @@ namespace FastGithub.DomainResolve
         private readonly SemaphoreSlim speedSemaphore = new(8, 8);
 
         /// <summary>
+        /// 【v2.6.14 P0】冷启动（第一轮）测速的域名并发上限。
+        /// <para>
+        /// 取 3（稳态为 8）。稳态并发是安全的：候选IP 已就位、DoH 端点各自有 RTT 样本。
+        /// 但进程刚起来时，22 个域名 × A/AAAA 会**同时**打向 5 个 DoH 端点，
+        /// 端点失败阈值按"次数"累计且不区分并发 —— 实测 11-15 18:20（v2.6.13 重启后 15 秒）
+        /// 有 3 个端点在 200 毫秒内接连熔断（18:20:45.046 / .249 / .250），
+        /// 另 2 个在 11 秒后（:56，正好是 12s 超时到点）熔断；随后所有解析只能回落到
+        /// 明文 DNS（本网络下 TCP:53 是"假可达"），请求整齐地卡在 25s 超时。
+        /// 首轮降到 3 路后，端点始终有请求成功，熔断计数自然清零。
+        /// </para>
+        /// </summary>
+        internal const int COLD_START_CONCURRENCY = 3;
+
+        private readonly SemaphoreSlim coldStartSemaphore = new(COLD_START_CONCURRENCY, COLD_START_CONCURRENCY);
+
+        /// <summary>
+        /// 已执行的测速轮次：0 表示尚未完成首轮（冷启动保护生效中）
+        /// </summary>
+        private int testRound;
+
+        /// <summary>
+        /// 候选池是否有变化待落盘（0/1，用 Interlocked 交换）
+        /// </summary>
+        private int stateDirty;
+
+        /// <summary>
+        /// 【v2.6.14 P0】落盘最小间隔。
+        /// <para>
+        /// 候选池变化可能很频繁（失败重选会触发 RefreshAsync），
+        /// 但落盘只为"下次启动不空窗"服务，没必要每次变化都写文件。
+        /// </para>
+        /// </summary>
+        private static readonly TimeSpan minSaveInterval = TimeSpan.FromSeconds(30d);
+
+        private DateTime lastSavedUtc = DateTime.MinValue;
+
+        /// <summary>
         /// 域名解析器
         /// </summary>
         /// <param name="dnsClient"></param>
@@ -152,9 +189,34 @@ namespace FastGithub.DomainResolve
             this.healthTracker = healthTracker;
             this.logger = logger;
 
-            foreach (var endPoint in persistence.ReadDnsEndPoints())
+            // 【v2.6.14 P0】装载上次运行落盘的候选IP：重启瞬间候选池不再为空。
+            // 旧实现只从文件里恢复 host:port，把地址数组一律填成空数组，
+            // 于是每个域名的首个请求都必须等一整轮 hosts -> DoH -> 明文DNS 解析，
+            // 期间任何请求都是 "找不到任何可成功连接的IP"（实测占 502 的 12%）。
+            var persistedEndPoints = persistence.ReadEndPoints();
+            var persistedAddressCount = 0;
+            foreach (var item in persistedEndPoints)
             {
-                this.dnsEndPointAddress.TryAdd(endPoint, Array.Empty<IPAddress>());
+                if (item.Addresses.Count == 0)
+                {
+                    this.dnsEndPointAddress.TryAdd(item.EndPoint, Array.Empty<IPAddress>());
+                    continue;
+                }
+
+                var addresses = new IPAddress[item.Addresses.Count];
+                for (var i = 0; i < item.Addresses.Count; i++)
+                {
+                    addresses[i] = item.Addresses[i].Address;
+                }
+                this.dnsEndPointAddress[item.EndPoint] = addresses;
+                this.addressService.Seed(item.EndPoint, item.Addresses);
+                persistedAddressCount += addresses.Length;
+            }
+
+            if (persistedEndPoints.Count > 0)
+            {
+                this.logger.LogInformation(
+                    $"已装载 {persistedEndPoints.Count} 个域名的历史候选IP（共 {persistedAddressCount} 个），重启不再空窗");
             }
         }
 
@@ -177,7 +239,9 @@ namespace FastGithub.DomainResolve
             {
                 if (this.dnsEndPointAddress.TryAdd(endPoint, Array.Empty<IPAddress>()))
                 {
-                    await this.persistence.WriteDnsEndPointsAsync(this.dnsEndPointAddress.Keys, cancellationToken);
+                    // 【v2.6.14 P0】不再在请求路径上直接写盘（旧实现每次都全量序列化，
+                    // 首个请求要为磁盘 IO 让路）；只标脏，由下一轮测速统一落盘。
+                    Volatile.Write(ref this.stateDirty, 1);
                 }
 
                 // 【关键修复】按需解析的结果必须回写缓存。
@@ -199,6 +263,7 @@ namespace FastGithub.DomainResolve
                 if (resolved.Count > 0)
                 {
                     this.dnsEndPointAddress[endPoint] = resolved.ToArray();
+                    Volatile.Write(ref this.stateDirty, 1);
                 }
             }
         }
@@ -241,15 +306,61 @@ namespace FastGithub.DomainResolve
             var domainCount = 0;
             var addressCount = 0;
 
+            // 【v2.6.14 P0】第一轮走冷启动闸门（3 路），之后回到稳态并发（8 路）。
+            var isColdStart = Volatile.Read(ref this.testRound) == 0;
+            Interlocked.Increment(ref this.testRound);
+
             var tasks = this.dnsEndPointAddress
                 .OrderBy(item => item.Value.Length)
-                .Select(keyValue => this.TestSpeedOneAsync(keyValue.Key, keyValue.Value, hostsOnly, cancellationToken,
+                .Select(keyValue => this.TestSpeedOneAsync(keyValue.Key, keyValue.Value, hostsOnly, isColdStart, cancellationToken,
                     () => Interlocked.Increment(ref domainCount),
                     addr => Interlocked.Add(ref addressCount, addr)))
                 .ToArray();
 
             await Task.WhenAll(tasks);
+
+            // 【v2.6.14 P0】把本轮结果落盘，供下次启动直接装载。
+            await this.SaveStateAsync(cancellationToken);
             return (domainCount, addressCount);
+        }
+
+        /// <summary>
+        /// 【v2.6.14 P0】把当前候选池落盘。
+        /// <para>
+        /// 只写"有候选IP"的域名；节流 30 秒，避免失败重选时反复写盘。
+        /// 写失败只记日志（PersistenceService 内部已吞异常），不影响解析主链路。
+        /// </para>
+        /// </summary>
+        /// <param name="cancellationToken"></param>
+        /// <returns></returns>
+        private async Task SaveStateAsync(CancellationToken cancellationToken)
+        {
+            if (DateTime.UtcNow - this.lastSavedUtc < minSaveInterval)
+            {
+                return;
+            }
+            if (Interlocked.Exchange(ref this.stateDirty, 0) == 0)
+            {
+                return;
+            }
+            this.lastSavedUtc = DateTime.UtcNow;
+
+            try
+            {
+                var items = this.dnsEndPointAddress
+                    .Where(item => item.Value.Length > 0)
+                    .Select(item => new PersistedEndPoint(
+                        item.Key,
+                        item.Value.Select(address => new PersistedAddress(
+                            address,
+                            this.addressService.TryGetElapsed(item.Key, address, out var elapsed) ? elapsed : TimeSpan.Zero)).ToArray()))
+                    .ToArray();
+
+                await this.persistence.WriteEndPointsAsync(items, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+            }
         }
 
         /// <summary>
@@ -257,17 +368,20 @@ namespace FastGithub.DomainResolve
         /// </summary>
         /// <param name="onDomainTested">该域名参与测速后回调（并发计数用）</param>
         /// <param name="onAddressCount">回报该域名测速后的可用IP数（并发计数用）</param>
+        /// <param name="isColdStart">是否为启动首轮（走更保守的并发闸门）</param>
         private async Task TestSpeedOneAsync(
             DnsEndPoint dnsEndPoint,
             IPAddress[] oldAddresses,
             bool hostsOnly,
+            bool isColdStart,
             CancellationToken cancellationToken,
             Func<int> onDomainTested,
             Action<int> onAddressCount)
         {
+            var gate = isColdStart ? this.coldStartSemaphore : this.speedSemaphore;
             try
             {
-                await this.speedSemaphore.WaitAsync(cancellationToken);
+                await gate.WaitAsync(cancellationToken);
             }
             catch (OperationCanceledException)
             {
@@ -283,6 +397,7 @@ namespace FastGithub.DomainResolve
                 // 就整个域名不可用"。新结果优先，健康度排序会把好 IP 排前。
                 var newAddresses = MergeAddresses(probed, oldAddresses);
                 this.dnsEndPointAddress[dnsEndPoint] = newAddresses;
+                Volatile.Write(ref this.stateDirty, 1);
                 onAddressCount(newAddresses.Length);
                 onDomainTested();
 
@@ -305,7 +420,7 @@ namespace FastGithub.DomainResolve
             }
             finally
             {
-                this.speedSemaphore.Release();
+                gate.Release();
             }
         }
 
@@ -371,6 +486,7 @@ namespace FastGithub.DomainResolve
                 if (ReferenceEquals(reordered, addresses) == false)
                 {
                     this.dnsEndPointAddress[endPoint] = reordered;
+                    Volatile.Write(ref this.stateDirty, 1);
                 }
             }
         }
