@@ -44,10 +44,37 @@ namespace FastGithub.UI
             // "日志页右键复制时剪贴板被占用 -> COMException -> 托盘进程崩溃
             //  -> 后端随父进程退出 -> 加速静默失效" 的完整故障链。
             // UI 是后端的父进程，UI 活着才有加速；未处理异常一律吞掉继续跑。
-            app.DispatcherUnhandledException += (s, e) => e.Handled = true;
-            AppDomain.CurrentDomain.UnhandledException += (s, e) => { };
+            // 【v2.6.13 B2，借鉴上游 v2.5.0】兜底同时落盘：
+            // 纯吞异常会让"双击没反应 / 界面卡住"完全无线索，落盘后至少有一条可查记录。
+            app.DispatcherUnhandledException += (s, e) =>
+            {
+                WriteUiError("DispatcherUnhandledException", e.Exception);
+                e.Handled = true;
+            };
+            AppDomain.CurrentDomain.UnhandledException += (s, e) =>
+                WriteUiError("AppDomain.UnhandledException", e.ExceptionObject as Exception);
             app.StartupUri = new Uri(MAIN_WINDOWS, UriKind.Relative);
             app.Run();
+        }
+
+        /// <summary>
+        /// 把 UI 未处理异常追加写入 logs/ui-error.log。
+        /// <para>落盘本身任何失败都必须被吞掉——它是兜底的一部分，不能反过来让 UI 崩掉。</para>
+        /// </summary>
+        private static void WriteUiError(string source, Exception? exception)
+        {
+            try
+            {
+                var dir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs");
+                Directory.CreateDirectory(dir);
+                File.AppendAllText(
+                    Path.Combine(dir, "ui-error.log"),
+                    $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [{source}] {exception}{Environment.NewLine}");
+            }
+            catch
+            {
+                // 落盘失败不影响异常兜底
+            }
         }
 
         /// <summary>

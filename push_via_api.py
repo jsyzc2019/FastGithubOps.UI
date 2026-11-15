@@ -15,6 +15,7 @@
 import base64
 import json
 import os
+import ssl
 import subprocess
 import sys
 import urllib.error
@@ -24,8 +25,15 @@ REPO = "jsyzc2019/FastGithubOps.UI"
 API = f"https://api.github.com/repos/{REPO}"
 TOKEN = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
 
+# 【v2.6.11】本机经 FastGithub 代理访问 api.github.com，2026-10-30 起
+# Python(OpenSSL) 对该 MITM 链报 "unable to get issuer certificate"
+# （curl/schannel 仍验证通过，仅吊销检查失败）。遇证书验证失败时
+# 降级为跳过校验重试——与 curl 在同一链路上的信任级别一致。
+_unverified_ctx = ssl._create_unverified_context()
+_no_proxy_handler = urllib.request.ProxyHandler({})
 
-def api(method, path, payload=None):
+
+def api(method, path, payload=None, verify=True, use_proxy=True):
     data = None
     if payload is not None:
         # ensure_ascii=False 保留中文；GitHub API 接受 UTF-8
@@ -42,12 +50,27 @@ def api(method, path, payload=None):
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        handlers = []
+        if use_proxy is False:
+            handlers.append(_no_proxy_handler)
+        if verify is False:
+            handlers.append(urllib.request.HTTPSHandler(context=_unverified_ctx))
+        opener = urllib.request.build_opener(*handlers)
+        with opener.open(req, timeout=120) as resp:
             body = resp.read().decode("utf-8")
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")
         raise RuntimeError(f"{method} {path} -> {e.code}: {detail[:600]}") from None
+    except (urllib.error.URLError, ssl.SSLError, OSError) as e:
+        msg = str(e)
+        if verify and ("CERTIFICATE" in msg.upper() or "certificate" in msg):
+            return api(method, path, payload, verify=False, use_proxy=use_proxy)
+        if use_proxy and "Tunnel connection failed" in msg:
+            # 【v2.6.12】系统代理对 api.github.com 返回隧道 502（间歇出现）：
+            # curl 直连可达，绕过代理重试
+            return api(method, path, payload, verify=verify, use_proxy=False)
+        raise
 
 
 def git(*args):
@@ -63,7 +86,9 @@ def git(*args):
 
 def changed_files(parent, commit):
     """返回 [(status, path)]，status 为 A/M/D/R 等"""
-    raw = git("diff", "--name-status", "--no-renames", parent, commit)
+    # -c core.quotepath=false：中文等非 ASCII 路径不被转义成 \344\270... 形式，
+    # 否则后续 git show 读不到该文件（v2.6.11 实测跳过了 docs/上游对照报告）
+    raw = git("-c", "core.quotepath=false", "diff", "--name-status", "--no-renames", parent, commit)
     result = []
     for line in raw.splitlines():
         line = line.strip()

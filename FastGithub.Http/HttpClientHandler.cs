@@ -451,20 +451,49 @@ namespace FastGithub.Http
             // 验证证书有效性
             bool ValidateServerCertificate(object sender, X509Certificate? cert, X509Chain? chain, SslPolicyErrors errors)
             {
-                if (errors.HasFlag(SslPolicyErrors.RemoteCertificateNameMismatch))
+                var ignoreNameMismatch = this.domainConfig.TlsIgnoreNameMismatch;
+                var dnsNameMatches = false;
+                if (ignoreNameMismatch == false && errors.HasFlag(SslPolicyErrors.RemoteCertificateNameMismatch))
                 {
-                    if (this.domainConfig.TlsIgnoreNameMismatch == true)
-                    {
-                        return true;
-                    }
-
                     var domain = context.DnsEndPoint.Host;
                     var dnsNames = ReadDnsNames(cert);
-                    return dnsNames.Any(dns => IsMatch(dns, domain));
+                    dnsNameMatches = dnsNames.Any(dns => IsMatch(dns, domain));
                 }
 
-                return errors == SslPolicyErrors.None;
+                return IsCertificateAcceptable(errors, ignoreNameMismatch, dnsNameMatches);
             }
+        }
+
+        /// <summary>
+        /// 证书策略判定（纯函数，供 CandidatePolicySelfTest 自检）。
+        /// <para>
+        /// 【v2.6.13 A3，借鉴上游 v2.5.0】证书链错误（不受信任/过期/吊销）**绝不放行**。
+        /// 旧实现在 <c>TlsIgnoreNameMismatch</c> 分支里直接 <c>return true</c>，
+        /// 于是「名称不匹配 + 链错误」组合——恰是污染 IP 背后中间人的典型特征——
+        /// 被当成可信证书放行，这类 IP 会凭"响应快"排到候选头部，
+        /// 真实请求阶段却收不到数据，表现为页面转圈/时好时坏。
+        /// TlsIgnoreNameMismatch 的语义只允许放过"证书名与域名不符"（不发 SNI 时的正常现象）。
+        /// </para>
+        /// </summary>
+        /// <param name="errors">SSL 策略错误</param>
+        /// <param name="ignoreNameMismatch">域名配置是否忽略名称不匹配</param>
+        /// <param name="dnsNameMatches">证书 SAN/CN 是否仍与域名匹配</param>
+        internal static bool IsCertificateAcceptable(
+            System.Net.Security.SslPolicyErrors errors,
+            bool ignoreNameMismatch,
+            bool dnsNameMatches)
+        {
+            if (errors.HasFlag(System.Net.Security.SslPolicyErrors.RemoteCertificateChainErrors))
+            {
+                return false;
+            }
+
+            if (errors.HasFlag(System.Net.Security.SslPolicyErrors.RemoteCertificateNameMismatch))
+            {
+                return ignoreNameMismatch || dnsNameMatches;
+            }
+
+            return errors == System.Net.Security.SslPolicyErrors.None;
         }
 
         /// <summary>

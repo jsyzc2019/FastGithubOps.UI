@@ -1,5 +1,6 @@
 ﻿using FastGithub.Configuration;
 using FastGithub.DomainResolve;
+using FastGithub.Http;
 using Microsoft.AspNetCore.Builder;
 using System;
 using System.IO;
@@ -91,6 +92,10 @@ namespace FastGithub
 
             // 【v2.6.12】meta 官方段解析/归属/采样自检
             failed += MetaRangeSelfTest.Run();
+
+            // 【v2.6.13】候选池策略（合并/成功IP/测速周期）与 TLS 证书策略自检
+            failed += CandidatePolicySelfTest.Run();
+            failed += TlsPolicySelfTest.Run();
 
             Console.WriteLine(failed == 0
                 ? "=== 自检全部通过 ==="

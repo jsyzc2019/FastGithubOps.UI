@@ -18,6 +18,87 @@ namespace FastGithub.DomainResolve
         private const int MAX_IP_COUNT = 3;
 
         /// <summary>
+        /// 刷新时合并候选的上限（新结果优先 + 旧结果去重追加）。
+        /// <para>【v2.6.13 A2】借鉴上游 v2.4.2：刷新直接覆盖旧候选会让探测抖动时的
+        /// 单点结果把候选池从多个缩成 1 个，"更新IP 后反而打不开"。
+        /// 8 是上游实测值：足够冗余，又不至于让每轮测速对过多 IP 发起连接。</para>
+        /// </summary>
+        internal const int MAX_MERGED_ADDRESS_COUNT = 8;
+
+        /// <summary>
+        /// 合并新旧候选IP：新结果优先，旧结果中未重复的追加在后，上限 <see cref="MAX_MERGED_ADDRESS_COUNT"/>。
+        /// <para>纯函数，由 CandidatePolicySelfTest 钉死"不塌缩/去重/上限"三条性质。</para>
+        /// </summary>
+        internal static IPAddress[] MergeAddresses(IPAddress[] newAddresses, IEnumerable<IPAddress> oldAddresses)
+        {
+            if (oldAddresses == null)
+            {
+                return newAddresses;
+            }
+
+            var merged = new List<IPAddress>(newAddresses.Length + MAX_MERGED_ADDRESS_COUNT);
+            var exists = new HashSet<IPAddress>();
+
+            foreach (var address in newAddresses)
+            {
+                if (merged.Count >= MAX_MERGED_ADDRESS_COUNT)
+                {
+                    break;
+                }
+                if (exists.Add(address))
+                {
+                    merged.Add(address);
+                }
+            }
+
+            foreach (var address in oldAddresses)
+            {
+                if (merged.Count >= MAX_MERGED_ADDRESS_COUNT)
+                {
+                    break;
+                }
+                if (exists.Add(address))
+                {
+                    merged.Add(address);
+                }
+            }
+
+            return merged.ToArray();
+        }
+
+        /// <summary>
+        /// 把最近连接成功的 IP 提到候选首位（成功 IP 记忆）。
+        /// <para>
+        /// 【v2.6.13 A4】借鉴上游 v2.4.4：浏览器打开一个页面会并发几十个请求，
+        /// 每个新连接都从头逐个试候选 IP，落到坏 IP 的请求白等一次超时，页面整体卡住。
+        /// 若地址不在候选列表中则原样返回（不引入新 IP）。
+        /// </para>
+        /// </summary>
+        internal static IPAddress[] ReorderWithFirst(IPAddress[] addresses, IPAddress first)
+        {
+            if (addresses.Length <= 1 || addresses[0].Equals(first))
+            {
+                return addresses;
+            }
+            if (Array.IndexOf(addresses, first) < 0)
+            {
+                return addresses;
+            }
+
+            var reordered = new IPAddress[addresses.Length];
+            reordered[0] = first;
+            var index = 1;
+            foreach (var address in addresses)
+            {
+                if (address.Equals(first) == false)
+                {
+                    reordered[index++] = address;
+                }
+            }
+            return reordered;
+        }
+
+        /// <summary>
         /// 单个域名因IP被拉黑而触发重选的最小间隔
         /// <para>
         /// 取 10 秒（原 30 秒）：本值与「拉黑判定 + 拉黑时长」串联构成恢复时延。
@@ -195,7 +276,12 @@ namespace FastGithub.DomainResolve
 
             try
             {
-                var newAddresses = await this.addressService.GetAddressesAsync(dnsEndPoint, oldAddresses, hostsOnly, cancellationToken);
+                var probed = await this.addressService.GetAddressesAsync(dnsEndPoint, oldAddresses, hostsOnly, cancellationToken);
+
+                // 【v2.6.13 A2】合并而非覆盖：本次探测只选出 1 个 IP 时（网络抖动常见），
+                // 旧候选仍保留在后作为兜底，避免"刷新后候选池塌缩为单点、随后该点被阻断
+                // 就整个域名不可用"。新结果优先，健康度排序会把好 IP 排前。
+                var newAddresses = MergeAddresses(probed, oldAddresses);
                 this.dnsEndPointAddress[dnsEndPoint] = newAddresses;
                 onAddressCount(newAddresses.Length);
                 onDomainTested();
@@ -262,6 +348,7 @@ namespace FastGithub.DomainResolve
                 HostsUpdated = hosts.Success,
                 HostsDomainCount = hosts.DomainCount,
                 HostsError = hosts.Error,
+                HostsSource = hosts.Source,
             };
         }
 
@@ -273,6 +360,19 @@ namespace FastGithub.DomainResolve
         public void ReportSuccess(DnsEndPoint endPoint, IPAddress address)
         {
             this.healthTracker.ReportSuccess(endPoint.Host, address);
+
+            // 【v2.6.13 A4】成功 IP 记忆：把刚连上的 IP 提到候选首位，
+            // 后续并发请求直接命中，不再逐个试错（上游 v2.4.4 修「页面转圈」的机制）。
+            if (this.dnsEndPointAddress.TryGetValue(endPoint, out var addresses) &&
+                addresses.Length > 1 &&
+                addresses[0].Equals(address) == false)
+            {
+                var reordered = ReorderWithFirst(addresses, address);
+                if (ReferenceEquals(reordered, addresses) == false)
+                {
+                    this.dnsEndPointAddress[endPoint] = reordered;
+                }
+            }
         }
 
         /// <summary>
@@ -367,6 +467,7 @@ namespace FastGithub.DomainResolve
                 HostsUpdated = hosts.Success,
                 HostsDomainCount = hosts.DomainCount,
                 HostsError = hosts.Error,
+                HostsSource = hosts.Source,
             };
         }
 

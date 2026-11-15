@@ -39,5 +39,10 @@ namespace FastGithub.UI
         /// 成功命中的 hosts 源 URL（v2.6.12 多源 failover）
         /// </summary>
         public string? HostsSource { get; set; }
+
+        /// <summary>
+        /// 后端 45 秒预算耗尽、刷新转入后台续跑（v2.6.13 软超时）
+        /// </summary>
+        public bool TimedOut { get; set; }
     }
 }

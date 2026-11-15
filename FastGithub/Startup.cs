@@ -153,20 +153,54 @@ namespace FastGithub
             });
 
             // 触发IP刷新：优先使用在线hosts源并重新测速，返回真实刷新结果。
-            // 【v2.6.11 关键修复，借鉴上游 v2.3.2】刷新不再绑定请求生命周期（context.RequestAborted）：
-            // 此前 UI 的 HttpClient 超时仅 10s，全量"清缓存→重解析→测速"一旦超过 10s，
-            // UI 断开会把刷新拦腰砍断 —— 而本刷新的语义是**先清缓存**，被砍断后系统处于
-            // "旧缓存已失效、新结果未就绪"的半刷新态，比不刷新更糟。
-            // 现用独立 45s 预算驱动：UI 等不等得到结果，刷新都完整走完。
-            // UI 侧（MainWindow.RefreshIpAsync）超时 60s，响应未到不中途断开。
+            // 【v2.6.11】刷新不再绑定请求生命周期（context.RequestAborted）。
+            // 【v2.6.13 B1，借鉴上游 v2.4.1】进一步改为**软超时**：
+            // 原实现把 45s CTS 直接传给刷新任务，预算一耗尽就抛
+            // OperationCanceledException -> HTTP 500（UI 提示"IP更新失败"），
+            // 而此时刷新其实已完成大半、只是被取消。现在预算耗尽立即返回
+            // { timedOut: true, ... }，剩余域名在后台继续跑完，不取消、不报错。
+            // UI 侧（MainWindow.RefreshIpAsync）超时 60s，能稳定拿到响应。
             app.MapGet("/refresh-ip", async context =>
             {
                 var resolver = context.RequestServices.GetRequiredService<IDomainResolver>();
-                using var timeoutTokenSource = new CancellationTokenSource(TimeSpan.FromSeconds(45d));
-                var result = await resolver.RefreshHostsAsync(timeoutTokenSource.Token);
+                var logger = context.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("RefreshIp");
+
+                var refreshTask = resolver.RefreshHostsAsync(CancellationToken.None);
+                var completed = await Task.WhenAny(refreshTask, Task.Delay(TimeSpan.FromSeconds(45d)));
 
                 context.Response.ContentType = "application/json;charset=utf-8";
-                await context.Response.WriteAsJsonAsync(result, timeoutTokenSource.Token);
+                if (completed == refreshTask)
+                {
+                    await context.Response.WriteAsJsonAsync(await refreshTask);
+                }
+                else
+                {
+                    // 后台继续跑完；观察异常避免 unobserved task exception
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            var result = await refreshTask;
+                            logger.LogInformation(
+                                $"IP刷新（后台续跑）完成：{result.DomainCount}个域名、{result.AddressCount}个可用IP");
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogWarning($"IP刷新（后台续跑）异常：{ex.Message}");
+                        }
+                    });
+
+                    await context.Response.WriteAsJsonAsync(new Dictionary<string, object?>
+                    {
+                        ["timedOut"] = true,
+                        ["domainCount"] = 0,
+                        ["addressCount"] = 0,
+                        ["hostsUpdated"] = false,
+                        ["hostsDomainCount"] = 0,
+                        ["hostsError"] = "刷新仍在进行（45秒预算耗尽，后台继续）",
+                        ["hostsSource"] = null,
+                    });
+                }
             });
 
             // 【v2.6.4 新增】UI 退出时显式通知主程序停机。

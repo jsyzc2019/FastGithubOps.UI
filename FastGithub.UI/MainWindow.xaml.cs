@@ -160,7 +160,11 @@ namespace FastGithub.UI
                 }
 
                 string message;
-                if (result != null)
+                if (result != null && result.TimedOut)
+                {
+                    message = "IP更新部分完成（45秒预算耗尽，后台继续刷新中）";
+                }
+                else if (result != null)
                 {
                     message = $"IP更新完成：{result.DomainCount}个域名、{result.AddressCount}个可用IP";
                     message += result.HostsUpdated
