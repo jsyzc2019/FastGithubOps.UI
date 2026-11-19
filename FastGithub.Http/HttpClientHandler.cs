@@ -514,7 +514,19 @@ namespace FastGithub.Http
             }
             else
             {
-                if (this.domainConfig.IPAddress != null)
+                // 固定 IP 列表优先：按配置顺序依次 yield，首个连不上时由上层串行回退，
+                // 全部失败后再回退到动态解析。列表与单 IP 同时配置时列表优先。
+                if (this.domainConfig.IPAddresses is { Length: > 0 } ipAddresses)
+                {
+                    foreach (var ip in ipAddresses)
+                    {
+                        if (ip != null)
+                        {
+                            yield return new IPEndPoint(ip, dnsEndPoint.Port);
+                        }
+                    }
+                }
+                else if (this.domainConfig.IPAddress != null)
                 {
                     yield return new IPEndPoint(this.domainConfig.IPAddress, dnsEndPoint.Port);
                 }
