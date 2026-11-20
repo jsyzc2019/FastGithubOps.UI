@@ -81,16 +81,33 @@ dotnet build FastGithub.UI/FastGithub.UI.csproj -c Release -m:1 -nr:false
 
 ## 运行
 
-- **正常用法**：以**管理员身份**运行 `fastgithub.exe`。
-  透明拦截（DNS 劫持 + WinDivert 驱动）需要管理员权限。
-- **降级用法**：驱动被杀软拦截或不想用管理员权限时，程序仍会监听 `127.0.0.1:38457`，
-  手动把系统代理设为该地址即可继续使用 —— 这是本版新增的兜底通道，原版此时会直接退出。
+- **Windows 桌面模式**。打开 `FastGithub.UI.exe`，按 Windows 提示确认管理员权限。托盘程序检查实际权限后启动后端，后端继承管理员权限，用于 WinDivert 透明拦截和系统证书安装。
+- **正向代理兜底**。驱动无法加载时，可以将客户端的 HTTP 代理设为 `127.0.0.1:38457`。
 - **服务模式**：`fastgithub start` / `fastgithub stop` 安装与卸载 Windows 服务。
 - **手动刷新 IP**：访问 `http://127.0.0.1:45678/refresh-ip`。
   该端口由程序按占用情况动态选取（`GlobalListener.UiHttpPort`），
   **以启动日志中打印的实际端口为准**；托盘 UI 会自动使用正确端口。
-- **证书**：首次启动在 `cacert/` 生成自签 CA 并尝试装入「受信任的根证书颁发机构」；
-  非管理员运行会失败并提示手动安装。
+- **证书**。首次启动在 `cacert/` 生成自签 CA 并尝试装入「受信任的根证书颁发机构」。系统证书安装失败后，会尝试当前用户的证书存储。
+
+### Windows 登录自启
+
+1. 以管理员身份将完整程序包解压到受保护的本地目录，例如 `C:\Program Files\FastGithubOps.UI`。普通用户可写的目录无法用于管理员自启。
+2. 使用要自动启动托盘的管理员账户打开 `FastGithub.UI.exe`。在托盘菜单的「设置」勾选「登录时以管理员身份启动」，点击「确定」。也可同时开启「启动后最小化」。
+3. 该管理员账户下次登录 Windows 时，任务计划程序以最高权限启动托盘和后端。首次启用时需要管理员授权，后续登录由 Windows 执行已注册的任务。
+
+从 v2.6.16 等旧版本升级时，在新版设置中勾选并保存一次。新版在确认计划任务已注册后移除该账户的旧 `HKCU\Run` 项。取消勾选并保存可关闭自启。移动或卸载前先关闭自启，换目录后在新位置重新启用。
+
+以管理员身份打开 PowerShell 可核对当前账户的任务。应看到 `Highest`、`Interactive`、登录触发器和完整的程序路径。注销并重新登录后，在任务管理器「详细信息」中打开「已提升」列，确认托盘和后端进程均显示「是」。
+
+```powershell
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$task = Get-ScheduledTask -TaskName "FastGithub.UI-$sid"
+$task.Principal | Select-Object UserId, LogonType, RunLevel
+$task.Triggers | Select-Object UserId, Enabled, CimClass
+$task.Actions | Select-Object Execute, Arguments, WorkingDirectory
+```
+
+任务在当前管理员账户的交互式登录会话中启动。若使用另一个账户的管理员凭据运行程序，自启任务属于那个管理员账户。相关权限和触发规则见 [Microsoft 任务计划程序文档](https://learn.microsoft.com/en-us/windows/win32/taskschd/security-contexts-for-running-tasks)。
 
 ## 验证记录
 

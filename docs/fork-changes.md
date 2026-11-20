@@ -68,11 +68,11 @@ sequenceDiagram
 
 实机验收时，核对托盘提示、日志和 `IPAddresses`，再通过 FastGitHub 运行真实 `git clone`。`info/refs` 的平均响应速率包含建连和等待，适合候选排序。完整 clone 的吞吐需使用实际传输字节和时长。
 
-## 三、UI 非管理员警告（`39f8028` + `190d9c7`）
+## 三、v2.6.15 的 UI 非管理员警告（`39f8028` + `190d9c7`）
 
-`app.manifest` 已声明 `requireAdministrator`（正常双击一定提权），但 `start`/脚本/启动器直拉可绕过。此前 `Program.cs` 无运行时检测，后端在 WinDivert 失败时静默降级为 `127.0.0.1:38457` 正向代理，用户无感知。
+`app.manifest` 声明 `requireAdministrator`，由 Windows 在正常打开程序时请求管理员权限。在兼容性设置影响启动权限的情况下，仍需要运行时检查。此前 `Program.cs` 无运行时检测，后端在 WinDivert 失败时静默降级为 `127.0.0.1:38457` 正向代理，用户无感知。
 
-修复：`Program.IsAdministrator()` 检测（`WindowsIdentity`/`WindowsPrincipal`，注意 UI 工程为 `net45`，类型在 `System.Security.Principal` 命名空间而非 .NET Core 的 `.Windows`）；非管理员时弹窗「继续降级/退出」（默认退出）+ 托盘气泡二次提醒。
+v2.6.15 通过 `WindowsIdentity` 和 `WindowsPrincipal` 检查令牌，非管理员时允许用户选择继续降级，并在托盘提醒。当前源码要求托盘始终以管理员身份运行，登录自启的设置与迁移见 [Windows 登录自启](../README.md#windows-登录自启)。
 
 WPF 遇到内存耗尽时走默认异常退出路径，`ui-error.log` 记录 PID 和终止状态。后端通过父进程退出监测进行清理。
 
@@ -92,7 +92,7 @@ WPF 遇到内存耗尽时走默认异常退出路径，`ui-error.log` 记录 PID
 
 ## 运行前提
 
-- 透明拦截依赖 **WinDivert 内核驱动**，必须以**管理员身份**运行；普通身份会降级为 `38457` 正向代理（本 fork 已加 UI 警告）。
+- 透明拦截依赖 **WinDivert 内核驱动**，需要管理员权限。驱动无法加载时，后端提供 `38457` 正向代理。
 - 不要在沙箱/受限会话中启动（WinDivert 抓不到真实 DNS 流量，且 WPF UI 无法维持会连带核心进程退出）。
 - 确认拦截生效：管理员启动后 `Resolve-DnsName github.com -Type A` 应返回 `127.0.0.1`。
 
