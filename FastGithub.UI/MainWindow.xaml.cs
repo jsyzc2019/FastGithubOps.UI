@@ -63,6 +63,17 @@ namespace FastGithub.UI
             {
                 this.Hide();
             }
+
+            // 未以管理员身份运行时，托盘再提醒一次（此时用户已在启动弹窗选择「继续降级」）。
+            // 启动弹窗点掉后容易遗忘，托盘气泡作为持续可见的二次提醒。
+            if (Program.IsAdministrator() == false)
+            {
+                this.notifyIcon.ShowBalloonTip(
+                    5000,
+                    FASTGITHUB_UI,
+                    "未以管理员身份运行，透明拦截已降级为正向代理，加速效果受限。",
+                    System.Windows.Forms.ToolTipIcon.Warning);
+            }
         }
 
         /// <summary>
