@@ -3,9 +3,9 @@ using System;
 namespace FastGithub.Http
 {
     /// <summary>
-    /// 【v2.6.14 P1】遥测上报请求的超时策略。
+    /// 【v2.6.14 P1】请求超时策略：遥测 fail-fast + git 智能协议宽松预算。
     /// <para>
-    /// GitHub 的页面会持续发送统计 beacon（<c>collector.github.com/github/collect</c>、
+    /// 遥测上报（beacon）：GitHub 的页面会持续发送统计 beacon（<c>collector.github.com/github/collect</c>、
     /// <c>api.github.com/_private/browser/rum|stats</c>）。它们对**用户无任何价值**：
     /// 浏览器不等结果、失败也不影响页面。但当前配置会让它们吃满域名的整体预算
     /// （api.github.com = 25s，collector 走 *.github.com = 30s）。
@@ -15,6 +15,13 @@ namespace FastGithub.Http
     /// 也就是说故障窗口内它们持续占用连接与线程，把真正有用的请求挤在队列里。
     /// 给它们 8 秒的 fail-fast 预算，收益是"故障时不再放大排队"，代价是统计报表少几条
     /// 本来就会丢的 beacon。
+    /// </para>
+    /// <para>
+    /// git 智能协议（fork 改动）：git clone/pull/push 的大 pack 传输远超域名默认的整体预算
+    /// （github.com = 25s），会在传输中途被 CancellationToken 砍断，表现为
+    /// <c>unexpected disconnect while reading sideband packet</c> / <c>invalid index-pack output</c>。
+    /// 故对 <c>info/refs</c> / <c>git-upload-pack</c> / <c>git-receive-pack</c> 单独放宽到
+    /// <see cref="GitTimeout"/>（10 分钟）。详见 <see cref="IsGitSmartHttpRequest"/>。
     /// </para>
     /// </summary>
     public static class TelemetryPolicy
