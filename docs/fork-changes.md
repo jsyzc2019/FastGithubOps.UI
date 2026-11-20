@@ -35,11 +35,13 @@
 ### 修复
 
 - **源码级（`4a28e4c`）**：`TelemetryPolicy.LimitTimeout` 对 git 智能协议请求（路径后缀 `info/refs` / `git-upload-pack` / `git-receive-pack`）单独放宽到 10 分钟；普通请求仍按域名默认预算快速失败。配置级 `b21e4c0` 的 90s 因此被取代（运行实例可回退为默认 25s，由代码自动放宽 git 请求）。
-- **配置级（运行实例）**：给 `github.com` 加 `"IPAddress": "20.6.7.17"`（实测 git 协议吞吐最优的官方 IP），`DomainConfig.IPAddress` 在 `GetIPEndPointsAsync` 中优先 yield、动态解析作 fallback。
+- **配置级（运行实例）**：给 `github.com` 加 `"IPAddress": "20.6.7.17"`（实测 git 协议吞吐最优的官方 IP），`DomainConfig.IPAddress` 建连时优先尝试，失败后再尝试动态解析。
 
 ## 二、固定 IP 列表（`9274068` + `2e8ad45`）
 
-`DomainConfig` 新增 `IPAddresses[]`（列表 + 优先级），与单 `IPAddress` 向后兼容、列表优先；`HttpClientHandler.GetIPEndPointsAsync` 按列表顺序 yield，首个连不上由上层串行回退，全部失败再回退动态解析。用于需要固定多个候选 IP 的场景。
+固定地址由 `IPAddresses` 按配置顺序提供，也兼容旧的单项 `IPAddress`。新连接优先拨固定地址。固定候选无法连接时，在同一个 10 秒建连预算内尝试去重后的动态地址，三条固定地址失败后仍给动态池留一次机会。解析阶段只占剩余时限的一部分，回退使用时限内已取得的地址。
+
+`--SelfTest` 通过模拟拨号覆盖固定地址成功时直接返回，以及前三条固定地址失败后连接动态地址。
 
 ### 托盘重新选优
 

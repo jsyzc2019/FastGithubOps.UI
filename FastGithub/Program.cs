@@ -95,6 +95,7 @@ namespace FastGithub
 
             // 【v2.6.13】候选池策略（合并/成功IP/测速周期）与 TLS 证书策略自检
             failed += CandidatePolicySelfTest.Run();
+            failed += HttpCandidateSelfTest.Run();
             failed += TlsPolicySelfTest.Run();
 
             // 【v2.6.14】候选IP 持久化（往返/旧格式/坏文件）、DoH 失败去抖、遥测超时策略

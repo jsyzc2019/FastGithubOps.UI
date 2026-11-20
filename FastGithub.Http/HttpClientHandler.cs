@@ -11,7 +11,6 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Security;
 using System.Net.Sockets;
-using System.Runtime.CompilerServices;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Threading.Tasks;
@@ -40,8 +39,7 @@ namespace FastGithub.Http
         /// </summary>
         private TimeSpan ConnectBudget => this.domainConfig.ConnectTimeout ?? this.defaultConnectTimeout;
 
-        // 串行尝试的候选上限。正常情况下，按「健康度 + 时延」排序后的首个 IP 就能连上，
-        // 该上限只是约束「连续多个 IP 全坏」时的最坏耗时，不是并发数量。
+        // 通常至多串行尝试 3 个候选。固定池用完这 3 次后，仍允许一次动态回退。
         private const int MAX_TRY_COUNT = 3;
 
         // 串行尝试候选的总建连预算（不是单IP 的预算）。
@@ -229,152 +227,207 @@ namespace FastGithub.Http
         /// <param name="context"></param>
         /// <param name="cancellationToken"></param>
         /// <returns></returns>
-        private async ValueTask<Stream> ConnectCallback(SocketsHttpConnectionContext context, CancellationToken cancellationToken)
+        private ValueTask<Stream> ConnectCallback(SocketsHttpConnectionContext context, CancellationToken cancellationToken)
+        {
+            return this.ConnectWithCandidatesAsync(context.DnsEndPoint,
+                (endPoint, token) => this.ConnectAsync(context, endPoint, token), cancellationToken);
+        }
+
+        internal async ValueTask<Stream> ConnectWithCandidatesAsync(
+            DnsEndPoint endPoint,
+            Func<IPEndPoint, CancellationToken, ValueTask<(Stream Stream, bool FullyVerified)>> connect,
+            CancellationToken cancellationToken)
         {
             var innerExceptions = new List<Exception>();
-            var candidates = new List<IPEndPoint>();
+            var seen = new HashSet<IPAddress>();
             var blacklisted = new List<IPEndPoint>();
+            var attempted = 0;
 
-            await foreach (var ipEndPoint in this.GetIPEndPointsAsync(context.DnsEndPoint, cancellationToken))
+            IPAddress.TryParse(endPoint.Host, out var literalAddress);
+            var fixedAddresses = literalAddress != null ? new[] { literalAddress } : this.GetFixedAddresses();
+            var fixedCandidates = fixedAddresses.Select(AdmitCandidate).OfType<IPEndPoint>().Take(MAX_TRY_COUNT).ToArray();
+            var dynamicCandidates = new List<IPEndPoint>();
+
+            if (fixedAddresses.Length == 0)
             {
-                // 已被判定为不可用的IP不再浪费一次连接超时等待
-                if (this.domainResolver.IsBlacklisted(context.DnsEndPoint, ipEndPoint.Address))
+                // 普通域名沿用原有解析和建连顺序。
+                await foreach (var address in this.domainResolver.ResolveAsync(endPoint, cancellationToken))
                 {
-                    blacklisted.Add(ipEndPoint);
-                    innerExceptions.Add(new HttpConnectTimeoutException(ipEndPoint.Address));
-                    continue;
+                    if (AdmitCandidate(address) is { } candidate)
+                    {
+                        dynamicCandidates.Add(candidate);
+                    }
                 }
-                candidates.Add(ipEndPoint);
             }
 
-            // 兜底：若候选全部被拉黑，则强制回退，把已拉黑的IP也试一轮。
-            // 否则一次网络瞬断（WiFi抖动/网关重启）就能让某个域名的全部IP同时进黑名单，
-            // 该域名将在 BlacklistDuration 内完全不可用——"全挂"这个触发条件
-            // 天然就是"全黑"这个故障态。
-            if (candidates.Count == 0 && blacklisted.Count > 0)
-            {
-                candidates.AddRange(blacklisted);
-            }
-
-            // 串行尝试：按「健康度 + 时延」排序后逐个连接，首个成功即返回，
-            // 随后由 SocketsHttpHandler 连接池长期复用该连接（粘性）。
-            //
-            // 【为何不能并发竞速多个 IP】
-            // 早期版本在这里并发向最多 4 个候选 IP 同时发起 TCP+TLS 握手，谁先成功用谁、
-            // 其余连接在 TLS 握手完成后立刻 Dispose（等同 RST）。这带来两个严重后果：
-            //   1) 单次请求就在多个 GitHub 边缘 IP 上同时惊扰出完整 TLS 会话又迅速丢弃，
-            //      在服务端/风控看来与端口扫描、攻击流量高度相似，是「反复被阻断」的直接原因；
-            //   2) 赢家随机、IP 频繁漂移，叠加 DoH 周期重解析与每秒测速重排，
-            //      同一域名不断换 IP，进一步触发对端风控。
-            // 基线 v2.3.x 之所以「基本不会被阻断」，正是它每次只建一条连接并保持粘性。
-            // 这里恢复该模型：慢/不通的根因交给「更准的 IP 排序 + 健康度反馈 + DoH 新鲜解析」解决，
-            // 而不是靠并发抢跑——抢占只会更快地撞上风控。
-            // 整个"找一个可用 IP"的过程封顶，避免串行逐个等超时叠加成分钟级挂起。
             using var totalTimeoutSource = new CancellationTokenSource(totalConnectBudget);
             using var totalTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, totalTimeoutSource.Token);
+            var startedAt = Stopwatch.GetTimestamp();
 
-            // 【v2.6.8 P0 关键修复】单候选预算必须从"剩余总预算"里切，不能各用 ConnectBudget。
-            //
-            // 【v2.6.7 实测故障（日志 publish/v267/logs/log20261004.txt，4 次 ERR 全部同款）】
-            //   System.TimeoutException: 在 10s 内未能连接 github.com（已尝试 0 个候选IP）
-            //
-            // 【根因：两个常数互相矛盾，MAX_TRY_COUNT=3 对 github.com 是死代码】
-            //   appsettings.github.json  github.com.ConnectTimeout = 12s
-            //   本文件                   totalConnectBudget     = 10s   <-- 比单候选还小
-            // 第一个候选的 linkedToken 里同时挂着 12s 与 10s 两个令牌，**10s 那个先到**，
-            // 于是第一个候选耗尽总预算 → 进入 `totalTimeoutSource.IsCancellationRequested`
-            // 分支直接 `break`，候选 2、3 一次都没试过。
-            // 更糟的是该分支的报错文案取 `innerExceptions.Count`，
-            // 而此刻还没往里 Add 过任何异常 → 恒为 0 → 报"已尝试 0 个候选IP"。
-            // 用户看到这句话会误判为"解析层一个 IP 都没给出"，而真实情况是
-            // **解析层给了 1~3 个候选、是第一个候选吃掉了全部预算**。
-            // 这条误报文案已实测出现在 4 条用户可见的 502 上。
-            //
-            // 【正确做法：按剩余时间与剩余候选数动态等分】
-            //   本候选预算 = min(ConnectBudget, 剩余总预算 / 剩余候选数)
-            // 这样 3 个候选共享 10s，每个约 3.3s；而 github.com 单 IP 实测健康耗时
-            // 仅 0.4~1.1s，3.3s 足够完成 TCP+TLS，于是三个候选都能真正参与竞争。
-            // 若只有 1 个候选，它独享全部 10s（等价于原来的行为）。
-            // 反之若某域名配了 ConnectTimeout=25s（usercontent），切片后每个候选
-            // 仍能拿到 3.3s，不会因为配置的 25s 而挤掉后续候选。
-            var tryList = candidates.Take(MAX_TRY_COUNT).ToArray();
-            var totalBudgetStartedAt = Stopwatch.GetTimestamp();
-
-            for (var index = 0; index < tryList.Length; index++)
+            // 固定地址先尝试。按候选数为动态回退预留一个时间片，IP 字面量独享拨号时间。
+            var fixedDeadline = literalAddress != null
+                ? totalConnectBudget
+                : totalConnectBudget * fixedCandidates.Length / (fixedCandidates.Length + 1);
+            if (await TryConnectAsync(fixedCandidates, fixedDeadline) is { } fixedStream)
             {
-                var ipEndPoint = tryList[index];
-                var remainingCandidates = tryList.Length - index;
+                return fixedStream;
+            }
 
-                // 剩余总预算 = 总预算 - 已消耗。已耗尽则不再发起新的连接尝试。
-                var elapsed = Stopwatch.GetElapsedTime(totalBudgetStartedAt);
-                var remainingBudget = totalConnectBudget - elapsed;
-                if (remainingBudget <= TimeSpan.Zero)
+            var fixedAttempts = attempted;
+            if (fixedAddresses.Length > 0 && literalAddress == null)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                // 共享 DNS 查询可能继续填充缓存。请求最多用剩余时限的三分之一等待解析。
+                var resolveBudget = (totalConnectBudget - Stopwatch.GetElapsedTime(startedAt)) / 3;
+                if (resolveBudget > TimeSpan.Zero)
                 {
-                    innerExceptions.Add(new TimeoutException(
-                        $"在 {totalConnectBudget.TotalSeconds:F0}s 内未能连接 {context.DnsEndPoint.Host}（已尝试 {index} 个候选IP）"));
-                    this.logger?.LogWarning($"{context.DnsEndPoint.Host} 建连总预算耗尽，放弃剩余候选并触发IP更新");
-                    break;
-                }
-
-                // 本候选的预算：不超过配置值，但也不允许超过"剩余预算/剩余候选数"，
-                // 否则又会出现"第一个候选独吞全部预算、后续候选没机会"的原故障。
-                var slice = remainingBudget / remainingCandidates;
-                var budget = this.ConnectBudget < slice ? this.ConnectBudget : slice;
-
-                try
-                {
-                    using var timeoutTokenSource = new CancellationTokenSource(budget);
-                    using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(timeoutTokenSource.Token, totalTokenSource.Token);
-                    var (stream, verified) = await this.ConnectAsync(context, ipEndPoint, linkedTokenSource.Token);
-
-                    // 仅在完成 TLS 握手（证书链校验通过）后才回写健康度。
-                    // 纯 http 场景只完成 TCP 连通，证明不了该IP真正可用，保持统计中性。
-                    if (verified)
+                    var resolved = new ConcurrentQueue<IPAddress>();
+                    var resolveTask = this.CollectFallbackAddressesAsync(endPoint, resolved, cancellationToken);
+                    try
                     {
-                        this.domainResolver.ReportSuccess(context.DnsEndPoint, ipEndPoint.Address);
+                        await resolveTask.WaitAsync(resolveBudget, totalTokenSource.Token);
                     }
-                    return stream;
-                }
-                catch (OperationCanceledException)
-                {
-                    // 上层（浏览器/调用方）主动取消：如实抛出，不记为IP 失败
-                    cancellationToken.ThrowIfCancellationRequested();
-
-                    // 总预算耗尽：说明这批候选整体不可用（或网络极慢），立即停止逐个试，
-                    // 交给下面的"找不到可用IP → 触发刷新 + 重试"路径尽快恢复。
-                    // 注意用 index+1 而非 innerExceptions.Count —— 后者在本分支里
-                    // 尚未 Add 当前候选，报错会恒显示"已尝试 0 个"，掩盖真实尝试次数。
-                    if (totalTimeoutSource.IsCancellationRequested)
+                    catch (TimeoutException)
                     {
-                        innerExceptions.Add(new TimeoutException(
-                            $"在 {totalConnectBudget.TotalSeconds:F0}s 内未能连接 {context.DnsEndPoint.Host}（已尝试 {index + 1} 个候选IP）"));
-                        this.logger?.LogWarning(
-                            $"{context.DnsEndPoint.Host} 建连总预算耗尽（已尝试 {index + 1}/{tryList.Length} 个候选IP），放弃剩余候选并触发IP更新");
+                        this.logger?.LogDebug("{Host} 的动态解析仍在进行，使用预算内已获得的地址", endPoint.Host);
+                    }
+                    catch (OperationCanceledException) when (totalTimeoutSource.IsCancellationRequested)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                    }
+
+                    foreach (var address in resolved)
+                    {
+                        if (AdmitCandidate(address) is { } candidate)
+                        {
+                            dynamicCandidates.Add(candidate);
+                        }
+                    }
+                }
+            }
+
+            // 只有固定和动态池起初都没有可用地址时，才恢复对黑名单内地址的试探。
+            if (fixedCandidates.Length == 0 && dynamicCandidates.Count == 0)
+            {
+                dynamicCandidates.AddRange(blacklisted);
+            }
+
+            // 三条固定地址全失败时额外允许一个动态候选。实际拨号仍受同一个总时限约束。
+            var fallbackLimit = Math.Max(1, MAX_TRY_COUNT - fixedAttempts);
+            if (await TryConnectAsync(dynamicCandidates.Take(fallbackLimit).ToArray(), totalConnectBudget, fixedAttempts > 0) is { } dynamicStream)
+            {
+                return dynamicStream;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            if (totalTimeoutSource.IsCancellationRequested || Stopwatch.GetElapsedTime(startedAt) >= totalConnectBudget)
+            {
+                innerExceptions.Add(new TimeoutException(
+                    $"在 {totalConnectBudget.TotalSeconds:F0}s 内未能连接 {endPoint.Host}（已尝试 {attempted} 个候选IP）"));
+                this.logger?.LogWarning($"{endPoint.Host} 建连总预算耗尽，已尝试 {attempted} 个候选IP");
+            }
+            if (innerExceptions.Count == 0)
+            {
+                innerExceptions.Add(new InvalidOperationException($"{endPoint.Host} 未能解析到任何可用ip"));
+            }
+
+            _ = this.RefreshIpAsync(endPoint.Host);
+            throw new AggregateException("找不到任何可成功连接的IP，已自动触发IP更新，请稍后重试", innerExceptions);
+
+            IPEndPoint? AdmitCandidate(IPAddress address)
+            {
+                if (seen.Add(address) == false)
+                {
+                    return null;
+                }
+
+                var candidate = new IPEndPoint(address, endPoint.Port);
+                if (this.domainResolver.IsBlacklisted(endPoint, address))
+                {
+                    blacklisted.Add(candidate);
+                    innerExceptions.Add(new HttpConnectTimeoutException(address));
+                    return null;
+                }
+
+                return candidate;
+            }
+
+            async ValueTask<Stream?> TryConnectAsync(IPEndPoint[] candidates, TimeSpan deadline, bool isFallback = false)
+            {
+                for (var index = 0; index < candidates.Length; index++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var remainingBudget = deadline - Stopwatch.GetElapsedTime(startedAt);
+                    if (remainingBudget <= TimeSpan.Zero || totalTimeoutSource.IsCancellationRequested)
+                    {
                         break;
                     }
 
-                    // 本候选的独立预算用尽（总预算尚有余量）：这是**该 IP 自身**的失败证据，
-                    // 必须上报，否则坏 IP 会一直留在候选列表首位被反复优先尝试。
-                    this.domainResolver.ReportFailure(context.DnsEndPoint, ipEndPoint.Address);
-                    innerExceptions.Add(new HttpConnectTimeoutException(ipEndPoint.Address));
-                }
-                catch (Exception ex)
-                {
-                    this.domainResolver.ReportFailure(context.DnsEndPoint, ipEndPoint.Address);
-                    innerExceptions.Add(ex);
-                }
-            }
+                    // 每次拨号均分该阶段的剩余时间，慢候选给后续候选留出尝试机会。
+                    var slice = remainingBudget / (candidates.Length - index);
+                    var budget = this.ConnectBudget < slice ? this.ConnectBudget : slice;
+                    var candidate = candidates[index];
 
-            if (innerExceptions.Count == 0)
+                    try
+                    {
+                        using var attemptTimeout = CancellationTokenSource.CreateLinkedTokenSource(totalTokenSource.Token);
+                        attemptTimeout.CancelAfter(budget);
+                        attempted++;
+                        var (stream, verified) = await connect(candidate, attemptTimeout.Token);
+
+                        // HTTPS 完成 TLS 验证后才回写健康度。纯 HTTP 建连保持中性。
+                        if (verified)
+                        {
+                            this.domainResolver.ReportSuccess(endPoint, candidate.Address);
+                        }
+                        if (isFallback)
+                        {
+                            this.logger?.LogInformation("{Host} 固定 IP 建连失败，已使用动态地址 {Address}", endPoint.Host, candidate.Address);
+                        }
+                        return stream;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        if (totalTimeoutSource.IsCancellationRequested)
+                        {
+                            break;
+                        }
+
+                        this.domainResolver.ReportFailure(endPoint, candidate.Address);
+                        innerExceptions.Add(new HttpConnectTimeoutException(candidate.Address));
+                    }
+                    catch (Exception ex)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        this.domainResolver.ReportFailure(endPoint, candidate.Address);
+                        innerExceptions.Add(ex);
+                    }
+                }
+
+                return null;
+            }
+        }
+
+        private async Task CollectFallbackAddressesAsync(
+            DnsEndPoint endPoint, ConcurrentQueue<IPAddress> addresses, CancellationToken cancellationToken)
+        {
+            // 即使当前请求结束等待，仍观察共享解析任务的异常。
+            try
             {
-                // 走到这里说明连一个候选IP都没拿到（域名解析为空），不是连接超时。
-                // 语义上区别于 HttpConnectTimeoutException，否则上层无法区分两种故障。
-                innerExceptions.Add(new InvalidOperationException($"{context.DnsEndPoint.Host} 未能解析到任何可用ip"));
+                await foreach (var address in this.domainResolver.ResolveAsync(endPoint, cancellationToken))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    addresses.Enqueue(address);
+                }
             }
-
-            // 找不到任何可成功连接的IP时，自动触发IP更新，便于下次请求恢复
-            _ = this.RefreshIpAsync(context.DnsEndPoint.Host);
-            throw new AggregateException("找不到任何可成功连接的IP，已自动触发IP更新，请稍后重试", innerExceptions);
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex)
+            {
+                this.logger?.LogDebug(ex, "{Host} 的动态回退解析失败", endPoint.Host);
+            }
         }
 
         /// <summary>
@@ -530,41 +583,16 @@ namespace FastGithub.Http
         }
 
         /// <summary>
-        /// 解析为IPEndPoint
+        /// 读取用户配置的固定地址，列表优先于旧的单 IP 字段。
         /// </summary>
-        /// <param name="dnsEndPoint"></param>
-        /// <param name="cancellationToken"></param>
-        /// <returns></returns>
-        private async IAsyncEnumerable<IPEndPoint> GetIPEndPointsAsync(DnsEndPoint dnsEndPoint, [EnumeratorCancellation] CancellationToken cancellationToken)
+        private IPAddress[] GetFixedAddresses()
         {
-            if (IPAddress.TryParse(dnsEndPoint.Host, out var address))
+            if (this.domainConfig.IPAddresses is { Length: > 0 } addresses)
             {
-                yield return new IPEndPoint(address, dnsEndPoint.Port);
+                return addresses.OfType<IPAddress>().ToArray();
             }
-            else
-            {
-                // 固定 IP 列表优先：按配置顺序依次 yield，首个连不上时由上层串行回退，
-                // 全部失败后再回退到动态解析。列表与单 IP 同时配置时列表优先。
-                if (this.domainConfig.IPAddresses is { Length: > 0 } ipAddresses)
-                {
-                    foreach (var ip in ipAddresses)
-                    {
-                        if (ip != null)
-                        {
-                            yield return new IPEndPoint(ip, dnsEndPoint.Port);
-                        }
-                    }
-                }
-                else if (this.domainConfig.IPAddress != null)
-                {
-                    yield return new IPEndPoint(this.domainConfig.IPAddress, dnsEndPoint.Port);
-                }
 
-                await foreach (var item in this.domainResolver.ResolveAsync(dnsEndPoint, cancellationToken))
-                {
-                    yield return new IPEndPoint(item, dnsEndPoint.Port);
-                }
-            }
+            return this.domainConfig.IPAddress is { } address ? new[] { address } : Array.Empty<IPAddress>();
         }
 
         /// <summary>
