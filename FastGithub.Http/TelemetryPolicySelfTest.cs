@@ -22,6 +22,8 @@ namespace FastGithub.Http
             TestLookalikeHostNotTelemetry();
             TestLimitTimeout();
             TestLimitTimeoutKeepsSmallerConfigured();
+            TestGitSmartHttpRequest();
+            TestGitTimeout();
 
             Console.WriteLine(failed == 0
                 ? "TelemetryPolicySelfTest: 全部通过"
@@ -100,6 +102,39 @@ namespace FastGithub.Http
             Console.WriteLine("不放松已有更小预算");
             var kept = TelemetryPolicy.LimitTimeout(new Uri("https://collector.github.com/github/collect"), TimeSpan.FromSeconds(5d));
             Assert(kept == TimeSpan.FromSeconds(5d), $"域名已配 5s 时保留 5s（实际 {kept}）");
+        }
+
+        private static void TestGitSmartHttpRequest()
+        {
+            Console.WriteLine("git 智能协议请求识别");
+            Assert(TelemetryPolicy.IsGitSmartHttpRequest(new Uri("https://github.com/a/b.git/info/refs?service=git-upload-pack")),
+                "info/refs 判定为 git 请求");
+            Assert(TelemetryPolicy.IsGitSmartHttpRequest(new Uri("https://github.com/a/b.git/git-upload-pack")),
+                "git-upload-pack 判定为 git 请求");
+            Assert(TelemetryPolicy.IsGitSmartHttpRequest(new Uri("https://github.com/a/b.git/git-receive-pack")),
+                "git-receive-pack 判定为 git 请求");
+            Assert(TelemetryPolicy.IsGitSmartHttpRequest(new Uri("https://github.com/a/b.git/GIT-UPLOAD-PACK")),
+                "路径大小写不敏感");
+            Assert(TelemetryPolicy.IsGitSmartHttpRequest(new Uri("https://github.com/a/b")) == false,
+                "普通页面不判为 git 请求");
+            Assert(TelemetryPolicy.IsGitSmartHttpRequest(new Uri("https://github.com/a/b/info/refsx")) == false,
+                "相似路径 info/refsx 不误判");
+        }
+
+        private static void TestGitTimeout()
+        {
+            Console.WriteLine("git 请求宽松预算");
+            var git = TelemetryPolicy.LimitTimeout(new Uri("https://github.com/a/b.git/git-upload-pack"), TimeSpan.FromSeconds(25d));
+            Assert(git == TelemetryPolicy.GitTimeout, $"git 请求 25s 放宽到 10min（实际 {git}）");
+
+            var gitNull = TelemetryPolicy.LimitTimeout(new Uri("https://github.com/a/b.git/info/refs?service=git-upload-pack"), null);
+            Assert(gitNull == TelemetryPolicy.GitTimeout, $"git 请求未配置预算时给 10min（实际 {gitNull}）");
+
+            var keepLarger = TelemetryPolicy.LimitTimeout(new Uri("https://github.com/a/b.git/git-upload-pack"), TimeSpan.FromMinutes(30d));
+            Assert(keepLarger == TimeSpan.FromMinutes(30d), $"git 请求域名已配 30min 时保留 30min（实际 {keepLarger}）");
+
+            var normal = TelemetryPolicy.LimitTimeout(new Uri("https://github.com/a/b"), TimeSpan.FromSeconds(25d));
+            Assert(normal == TimeSpan.FromSeconds(25d), $"普通请求不受 git 策略影响（实际 {normal}）");
         }
     }
 }

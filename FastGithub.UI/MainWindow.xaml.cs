@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Configuration;
 using System.Diagnostics;
+using System.IO;
 using System.Net.Http;
 using System.Reflection;
 using System.Threading.Tasks;
@@ -15,6 +16,9 @@ namespace FastGithub.UI
     public partial class MainWindow : Window
     {
         private readonly System.Windows.Forms.NotifyIcon notifyIcon;
+        private readonly System.Windows.Forms.MenuItem pickIp;
+        private readonly System.Windows.Forms.MenuItem restoreIp;
+        private bool closed;
         private const string FASTGITHUB_UI = "FastGithub.UI";
         private const string RELEASES_URI = "https://github.com/yuan71058/FastGithub/releases";
 
@@ -39,13 +43,45 @@ namespace FastGithub.UI
             var exit = new System.Windows.Forms.MenuItem("关闭应用(&C)");
             exit.Click += (s, e) => this.ExitAppAsync();
 
+            // GitHub 选路配置和最近一次实际建连状态。
+            this.pickIp = new System.Windows.Forms.MenuItem("重新选优IP(&P)");
+            this.pickIp.Click += async (s, e) => await this.UpdateGitHubIpAsync(restoreAutomatic: false);
+            this.restoreIp = new System.Windows.Forms.MenuItem("恢复GitHub自动选路(&A)");
+            this.restoreIp.Click += async (s, e) => await this.UpdateGitHubIpAsync(restoreAutomatic: true);
+
+            var ipStatus = new System.Windows.Forms.MenuItem("查看GitHub建连状态(&I)");
+            ipStatus.Click += async (s, e) =>
+            {
+                ipStatus.Enabled = false;
+                try
+                {
+                    await this.RequestGitHubIpAsync(HttpMethod.Get, "/github-ip-status", TimeSpan.FromSeconds(5d), showDialog: true);
+                }
+                finally
+                {
+                    if (this.closed == false)
+                    {
+                        ipStatus.Enabled = true;
+                    }
+                }
+            };
+
+            var openConfig = new System.Windows.Forms.MenuItem("打开IP配置(&O)");
+            openConfig.Click += (s, e) => this.OpenIpConfigFile();
+
+            var openDir = new System.Windows.Forms.MenuItem("打开工具目录(&D)");
+            openDir.Click += (s, e) => this.OpenToolDirectory();
+
+            var separator = new System.Windows.Forms.MenuItem("-");
+
             var version = this.GetType().Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
             this.Title = $"{FASTGITHUB_UI} v{version}";
             this.notifyIcon = new System.Windows.Forms.NotifyIcon
             {
                 Visible = true,
-                Text = FASTGITHUB_UI,
-                ContextMenu = new System.Windows.Forms.ContextMenu(new[] { refreshIp, upgrade, settings, exit }),
+                Text = $"{FASTGITHUB_UI} · 管理员",
+                ContextMenu = new System.Windows.Forms.ContextMenu(new[]
+                    { refreshIp, this.pickIp, this.restoreIp, ipStatus, openConfig, openDir, separator, upgrade, settings, exit }),
                 Icon = System.Drawing.Icon.ExtractAssociatedIcon(System.Windows.Forms.Application.ExecutablePath)
             };
 
@@ -62,6 +98,118 @@ namespace FastGithub.UI
             if (Properties.Settings.Default.StartMinimized)
             {
                 this.Hide();
+            }
+        }
+
+        /// <summary>
+        /// 请求主程序更新固定 IP 或恢复自动选路。
+        /// </summary>
+        private async Task UpdateGitHubIpAsync(bool restoreAutomatic)
+        {
+            this.pickIp.Enabled = false;
+            this.restoreIp.Enabled = false;
+            try
+            {
+                if (restoreAutomatic == false)
+                {
+                    this.notifyIcon.ShowBalloonTip(3000, FASTGITHUB_UI, "正在探测 GitHub IP，完成后会显示结果。", System.Windows.Forms.ToolTipIcon.Info);
+                }
+                var path = restoreAutomatic ? "/restore-github-ip" : "/pick-github-ip";
+                var timeout = restoreAutomatic ? TimeSpan.FromSeconds(10d) : TimeSpan.FromMinutes(5d);
+                await this.RequestGitHubIpAsync(HttpMethod.Post, path, timeout);
+            }
+            finally
+            {
+                if (this.closed == false)
+                {
+                    this.pickIp.Enabled = true;
+                    this.restoreIp.Enabled = true;
+                }
+            }
+        }
+
+        private async Task RequestGitHubIpAsync(HttpMethod method, string path, TimeSpan timeout, bool showDialog = false)
+        {
+            bool success;
+            string message;
+            try
+            {
+                using var client = new HttpClient(new HttpClientHandler { UseProxy = false, AllowAutoRedirect = false })
+                {
+                    Timeout = timeout
+                };
+                using var request = new HttpRequestMessage(method, $"{AppPorts.UiHttpBaseUrl}{path}");
+                request.Headers.Add("X-FastGithub-UI", "1");
+                using var response = await client.SendAsync(request);
+                success = response.IsSuccessStatusCode;
+                message = response.Content == null ? string.Empty : await response.Content.ReadAsStringAsync();
+                if (string.IsNullOrWhiteSpace(message))
+                {
+                    message = $"主程序返回 HTTP {(int)response.StatusCode}，请确认 UI 和主程序使用同一版本。";
+                }
+            }
+            catch (TaskCanceledException)
+            {
+                success = false;
+                message = "GitHub IP 请求超时，请查看主程序日志。";
+            }
+            catch (Exception ex)
+            {
+                success = false;
+                message = $"GitHub IP 请求失败：{ex.Message}";
+            }
+
+            if (this.closed)
+            {
+                return;
+            }
+
+            if (showDialog)
+            {
+                System.Windows.MessageBox.Show(message, "GitHub 建连状态", MessageBoxButton.OK,
+                    success ? MessageBoxImage.Information : MessageBoxImage.Warning);
+            }
+            else
+            {
+                this.notifyIcon.ShowBalloonTip(5000, FASTGITHUB_UI, message,
+                    success ? System.Windows.Forms.ToolTipIcon.Info : System.Windows.Forms.ToolTipIcon.Warning);
+            }
+        }
+
+        /// <summary>
+        /// 用记事本打开 IP 配置文件（appsettings/appsettings.github.json）。
+        /// </summary>
+        private void OpenIpConfigFile()
+        {
+            var configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "appsettings", "appsettings.github.json");
+            if (File.Exists(configPath) == false)
+            {
+                this.notifyIcon.ShowBalloonTip(5000, FASTGITHUB_UI, "未找到 appsettings/appsettings.github.json", System.Windows.Forms.ToolTipIcon.Warning);
+                return;
+            }
+
+            try
+            {
+                Process.Start(new ProcessStartInfo("notepad.exe", $"\"{configPath}\"") { UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                this.notifyIcon.ShowBalloonTip(5000, FASTGITHUB_UI, $"打开配置失败：{ex.Message}", System.Windows.Forms.ToolTipIcon.Error);
+            }
+        }
+
+        /// <summary>
+        /// 在资源管理器中打开 FastGitHub 程序目录。
+        /// </summary>
+        private void OpenToolDirectory()
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo("explorer.exe", $"\"{AppDomain.CurrentDomain.BaseDirectory}\"") { UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                this.notifyIcon.ShowBalloonTip(5000, FASTGITHUB_UI, $"打开目录失败：{ex.Message}", System.Windows.Forms.ToolTipIcon.Error);
             }
         }
 
@@ -243,6 +391,7 @@ namespace FastGithub.UI
         /// <param name="e"></param>
         protected override void OnClosed(EventArgs e)
         {
+            this.closed = true;
             this.notifyIcon.Icon = null;
             this.notifyIcon.Dispose();
             base.OnClosed(e);

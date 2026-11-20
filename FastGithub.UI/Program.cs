@@ -1,6 +1,6 @@
 ﻿using Microsoft.Win32;
 using System;
-using System.Configuration;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
@@ -13,11 +13,28 @@ namespace FastGithub.UI
     {
         private const string MUTEX_NAME = "Global\\FastGithub.UI";
         private const string MAIN_WINDOWS = "MainWindow.xaml";
-        private const string FASTGITHUB_PATH = "fastgithub.exe";
+        internal const string BackendFileName = "fastgithub.exe";
+        private const string ElevationRetryArgument = "--elevation-retry";
+        private const int ErrorFileNotFound = 2;
+        private const int ElevationRequired = 740;
+        private const int ErrorCancelled = 1223;
 
         [STAThread]
         static void Main(string[] args)
         {
+            var scheduledStart = Array.IndexOf(args, AutoStartTask.StartupArgument) >= 0;
+            // 清单负责让 Windows 请求提权，实际令牌检查涵盖兼容性设置等启动方式。
+            if (IsAdministrator() == false)
+            {
+                if (scheduledStart == false)
+                {
+                    OfferElevation(Array.IndexOf(args, ElevationRetryArgument) >= 0);
+                }
+
+                Environment.ExitCode = ElevationRequired;
+                return;
+            }
+
             AppDomain.CurrentDomain.AssemblyResolve += OnAssemblyResolve;
             using var mutex = new Mutex(true, MUTEX_NAME, out var isFirstInstance);
             if (isFirstInstance == false)
@@ -25,17 +42,13 @@ namespace FastGithub.UI
                 return;
             }
 
-            var settings = Properties.Settings.Default;
-            if (settings.AutoStart)
+            var backendStartResult = StartFastGithub(scheduledStart);
+            if (scheduledStart && backendStartResult != 0)
             {
-                SetAutoStart(true);
-            }
-            else
-            {
-                SetAutoStart(false);
+                Environment.ExitCode = backendStartResult;
+                return;
             }
 
-            StartFastGithub();
             SetWebBrowserDPI();
             SetWebBrowserVersion();
 
@@ -43,38 +56,102 @@ namespace FastGithub.UI
             // 【v2.6.11 借鉴上游 v2.3.2】兜底未处理异常：上游实证过
             // "日志页右键复制时剪贴板被占用 -> COMException -> 托盘进程崩溃
             //  -> 后端随父进程退出 -> 加速静默失效" 的完整故障链。
-            // UI 是后端的父进程，UI 活着才有加速；未处理异常一律吞掉继续跑。
-            // 【v2.6.13 B2，借鉴上游 v2.5.0】兜底同时落盘：
-            // 纯吞异常会让"双击没反应 / 界面卡住"完全无线索，落盘后至少有一条可查记录。
+            // UI 是后端的父进程。普通异常继续记录并处理，内存耗尽由 WPF 默认路径结束进程。
             app.DispatcherUnhandledException += (s, e) =>
             {
-                WriteUiError("DispatcherUnhandledException", e.Exception);
-                e.Handled = true;
+                var terminating = IsOutOfMemory(e.Exception);
+                e.Handled = terminating == false;
+                WriteUiError("DispatcherUnhandledException", e.Exception, terminating);
             };
             AppDomain.CurrentDomain.UnhandledException += (s, e) =>
-                WriteUiError("AppDomain.UnhandledException", e.ExceptionObject as Exception);
+                WriteUiError("AppDomain.UnhandledException", e.ExceptionObject as Exception, e.IsTerminating);
             app.StartupUri = new Uri(MAIN_WINDOWS, UriKind.Relative);
             app.Run();
         }
 
+        private static void OfferElevation(bool isRetry)
+        {
+            if (isRetry)
+            {
+                MessageBox.Show("FastGithub.UI 仍未获得管理员权限。请检查 Windows 账户或权限策略。",
+                    "FastGithub", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            var answer = MessageBox.Show("FastGithub.UI 需要管理员权限。是否以管理员身份重新打开？",
+                "FastGithub", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+            if (answer != MessageBoxResult.Yes)
+            {
+                return;
+            }
+
+            // 权限检查发生在取得单实例互斥体和启动后端之前，提权后的实例可以直接完成启动。
+            try
+            {
+                var executablePath = System.Windows.Forms.Application.ExecutablePath;
+                using var process = Process.Start(new ProcessStartInfo
+                {
+                    FileName = executablePath,
+                    WorkingDirectory = Path.GetDirectoryName(executablePath),
+                    Arguments = ElevationRetryArgument,
+                    UseShellExecute = true,
+                    Verb = "runas"
+                });
+            }
+            catch (Win32Exception ex) when (ex.NativeErrorCode == ErrorCancelled)
+            {
+                // 用户取消了 Windows 权限确认，结束本次启动。
+            }
+            catch (Win32Exception ex)
+            {
+                MessageBox.Show($"无法以管理员身份重新打开 FastGithub.UI。{ex.Message}",
+                    "FastGithub", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private static bool IsOutOfMemory(Exception exception)
+        {
+            for (Exception? current = exception; current != null; current = current.InnerException)
+            {
+                if (current is OutOfMemoryException)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         /// <summary>
-        /// 把 UI 未处理异常追加写入 logs/ui-error.log。
+        /// 把 UI 未处理异常、进程号和终止状态追加写入 logs/ui-error.log。
         /// <para>落盘本身任何失败都必须被吞掉——它是兜底的一部分，不能反过来让 UI 崩掉。</para>
         /// </summary>
-        private static void WriteUiError(string source, Exception? exception)
+        private static void WriteUiError(string source, Exception? exception, bool terminating)
         {
             try
             {
                 var dir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs");
                 Directory.CreateDirectory(dir);
+                using var process = Process.GetCurrentProcess();
                 File.AppendAllText(
                     Path.Combine(dir, "ui-error.log"),
-                    $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [{source}] {exception}{Environment.NewLine}");
+                    $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [{source}] PID={process.Id} Terminating={terminating} {exception}{Environment.NewLine}");
             }
             catch
             {
                 // 落盘失败不影响异常兜底
             }
+        }
+
+        /// <summary>
+        /// 当前进程是否以管理员身份运行（已提升 token）。
+        /// <para>UAC 下普通令牌的 Administrators 组仅用于拒绝访问，此判断能区分「已提升」与「普通权限」，
+        /// 契合 WinDivert 内核驱动对管理员权限的要求。</para>
+        /// </summary>
+        public static bool IsAdministrator()
+        {
+            using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+            var principal = new System.Security.Principal.WindowsPrincipal(identity);
+            return principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
         }
 
         /// <summary>
@@ -130,45 +207,64 @@ namespace FastGithub.UI
         }
 
         /// <summary>
-        /// 启动fastgithub
+        /// 启动继承当前管理员令牌的后端进程。
         /// </summary>
-        /// <returns></returns>
-        private static void StartFastGithub()
+        private static int StartFastGithub(bool scheduledStart)
         {
-            var fastgithubPath = FindFastGithubPath();
+            var fastgithubPath = FindFastGithubPath(allowDevelopmentBuild: scheduledStart == false);
             if (fastgithubPath == null)
             {
-                // 原实现静默返回，用户看到的现象是"双击没反应"，无法判断是缺文件还是崩溃。
-                System.Windows.MessageBox.Show(
-                    $"未找到 {FASTGITHUB_PATH}，请确认它与 FastGithub.UI.exe 在同一目录下。",
-                    "FastGithub",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Error);
-                return;
+                var error = new FileNotFoundException($"未找到 {BackendFileName}，请确认它与 FastGithub.UI.exe 在同一目录下。");
+                return ReportBackendStartFailure(scheduledStart, error, ErrorFileNotFound);
             }
 
             var startInfo = new ProcessStartInfo
             {
                 FileName = fastgithubPath,
+                WorkingDirectory = Path.GetDirectoryName(fastgithubPath),
                 Arguments = $"--ParentProcessId={Process.GetCurrentProcess().Id} --UdpLoggerPort={UdpLogger.Port} --UiHttpPort={AppPorts.UiHttpPort}",
                 UseShellExecute = false,
                 CreateNoWindow = true
             };
-            Process.Start(startInfo);
+            try
+            {
+                // UseShellExecute 为 false 时直接创建进程。启动失败时 Windows 会提供原生错误码。
+                using var process = Process.Start(startInfo);
+                return 0;
+            }
+            catch (Win32Exception ex)
+            {
+                return ReportBackendStartFailure(scheduledStart, ex, ex.NativeErrorCode);
+            }
+        }
+
+        private static int ReportBackendStartFailure(bool scheduledStart, Exception error, int exitCode)
+        {
+            WriteUiError("StartFastGithub", error, terminating: scheduledStart);
+            if (scheduledStart == false)
+            {
+                MessageBox.Show(error.Message, "FastGithub", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            return exitCode;
         }
 
         /// <summary>
         /// 查找fastgithub.exe路径
         /// </summary>
         /// <returns></returns>
-        private static string? FindFastGithubPath()
+        private static string? FindFastGithubPath(bool allowDevelopmentBuild)
         {
             // 生产环境：与UI同目录
             var baseDir = AppDomain.CurrentDomain.BaseDirectory;
-            var localPath = Path.Combine(baseDir, FASTGITHUB_PATH);
+            var localPath = Path.Combine(baseDir, BackendFileName);
             if (File.Exists(localPath))
             {
                 return localPath;
+            }
+
+            if (allowDevelopmentBuild == false)
+            {
+                return null;
             }
 
             // 开发环境：向上查找FastGithub项目输出目录。
@@ -201,7 +297,7 @@ namespace FastGithub.UI
                     {
                         foreach (var candidate in Directory.GetDirectories(frameworkDir))
                         {
-                            var devPath = Path.Combine(candidate, FASTGITHUB_PATH);
+                            var devPath = Path.Combine(candidate, BackendFileName);
                             if (File.Exists(devPath))
                             {
                                 return devPath;
@@ -212,34 +308,6 @@ namespace FastGithub.UI
             }
 
             return null;
-        }
-
-        /// <summary>
-        /// 设置开机自启
-        /// </summary>
-        /// <param name="enable"></param>
-        public static void SetAutoStart(bool enable)
-        {
-            const string appName = "FastGithub.UI";
-            const string runKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
-            using var key = Registry.CurrentUser.OpenSubKey(runKey, true);
-            if (key == null)
-            {
-                return;
-            }
-
-            if (enable)
-            {
-                var exePath = Process.GetCurrentProcess().MainModule?.FileName;
-                if (exePath != null)
-                {
-                    key.SetValue(appName, exePath);
-                }
-            }
-            else
-            {
-                key.DeleteValue(appName, false);
-            }
         }
     }
 }

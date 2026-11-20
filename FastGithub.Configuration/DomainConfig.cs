@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Linq;
 using System.Net;
 
 namespace FastGithub.Configuration
@@ -30,7 +31,16 @@ namespace FastGithub.Configuration
         public IPAddress? IPAddress { get; init; }
 
         /// <summary>
-        /// 请求超时时长（整体：建连+传输+下载的总预算）
+        /// 使用的 IP 地址列表（按优先级降序）。
+        /// <para>
+        /// 用于固定多个候选 IP：首个连不上时依次回退，全部失败再回退到动态解析。
+        /// 与 <see cref="IPAddress"/> 同时配置时本列表优先（可覆盖单 IP 的场景）。
+        /// </para>
+        /// </summary>
+        public IPAddress[]? IPAddresses { get; init; }
+
+        /// <summary>
+        /// 建连和等待上游响应头的请求预算。
         /// </summary>
         public TimeSpan? Timeout { get; init; }
 
@@ -55,6 +65,19 @@ namespace FastGithub.Configuration
         /// 自定义响应
         /// </summary>
         public ResponseConfig? Response { get; init; }
+
+        /// <summary>
+        /// 读取用于拨号的固定地址，列表优先于旧的单 IP 字段。
+        /// </summary>
+        public IPAddress[] GetFixedAddresses()
+        {
+            if (this.IPAddresses is { Length: > 0 } addresses)
+            {
+                return addresses.OfType<IPAddress>().ToArray();
+            }
+
+            return this.IPAddress is { } address ? new[] { address } : Array.Empty<IPAddress>();
+        }
 
         /// <summary>
         /// 获取TlsSniPattern

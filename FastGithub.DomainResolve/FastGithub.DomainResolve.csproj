@@ -15,6 +15,8 @@
 		</None>
 		<None Include="../@dnscrypt-proxy/$(RuntimeIdentifier)/*" Link="dnscrypt-proxy/%(Filename)%(Extension)">
 			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+			<!-- 运行时从磁盘启动独立进程，单文件发布时也须复制到发布目录。 -->
+			<ExcludeFromSingleFile>true</ExcludeFromSingleFile>
 		</None>
 	</ItemGroup>
 

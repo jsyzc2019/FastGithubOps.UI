@@ -5,6 +5,7 @@ using System;
 using System.Diagnostics;
 using System.Text;
 using System.Threading.Tasks;
+using Yarp.ReverseProxy.Forwarder;
 
 namespace FastGithub.HttpServer.HttpMiddlewares
 {
@@ -52,18 +53,32 @@ namespace FastGithub.HttpServer.HttpMiddlewares
 
             var request = context.Request;
             var response = context.Response;
-            var exception = context.GetForwarderErrorFeature()?.Exception;
+            var forwarder = context.GetForwarderErrorFeature();
+            var exception = forwarder?.Exception;
+            var summary = $"{request.Method} {request.Scheme}://{request.Host}{request.Path} responded {response.StatusCode} in {stopwatch.Elapsed.TotalMilliseconds} ms";
+            var forwarderFailed = forwarder != null && forwarder.Error != ForwarderError.None;
+            if (forwarder != null && forwarderFailed)
+            {
+                summary += $" | ForwarderError={forwarder.Error} HasStarted={response.HasStarted} RequestAborted={context.RequestAborted.IsCancellationRequested} TraceId={context.TraceIdentifier}";
+            }
             if (exception == null)
             {
-                logger.LogInformation($"{request.Method} {request.Scheme}://{request.Host}{request.Path} responded {response.StatusCode} in {stopwatch.Elapsed.TotalMilliseconds} ms");
+                if (forwarderFailed)
+                {
+                    logger.LogWarning(summary);
+                }
+                else
+                {
+                    logger.LogInformation(summary);
+                }
             }
             else if (IsError(exception))
             {
-                logger.LogError($"{request.Method} {request.Scheme}://{request.Host}{request.Path} responded {response.StatusCode} in {stopwatch.Elapsed.TotalMilliseconds} ms{Environment.NewLine}{exception}");
+                logger.LogError($"{summary}{Environment.NewLine}{exception}");
             }
             else
             {
-                logger.LogWarning($"{request.Method} {request.Scheme}://{request.Host}{request.Path} responded {response.StatusCode} in {stopwatch.Elapsed.TotalMilliseconds} ms{Environment.NewLine}{GetMessage(exception)}");
+                logger.LogWarning($"{summary}{Environment.NewLine}{GetMessage(exception)}");
             }
         }
 

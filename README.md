@@ -75,18 +75,52 @@ dotnet build FastGithub.UI/FastGithub.UI.csproj -c Release -m:1 -nr:false
 | `appsettings/` | 9 份域名配置（github / google / microsoft / fastly …） |
 | `dnscrypt-proxy/` | 加密 DNS 组件 |
 
+## 发布
+
+维护者可通过 GitHub Actions 创建 Release，或在 Windows 上使用 `release-local.ps1` 演练打包及正式发布。版本准备、产物校验和重试步骤见 [发布流程](docs/本地发布流程.md)，各版本正文维护在 [release-notes](release-notes/README.md)。
+
 ## 运行
 
-- **正常用法**：以**管理员身份**运行 `fastgithub.exe`。
-  透明拦截（DNS 劫持 + WinDivert 驱动）需要管理员权限。
-- **降级用法**：驱动被杀软拦截或不想用管理员权限时，程序仍会监听 `127.0.0.1:38457`，
-  手动把系统代理设为该地址即可继续使用 —— 这是本版新增的兜底通道，原版此时会直接退出。
+- **Windows 桌面模式**。打开 `FastGithub.UI.exe`，按 Windows 提示确认管理员权限。主窗口和托盘图标提示会显示当前的管理员运行状态。如果手动启动时程序提示权限不足，可选择以管理员身份重新打开。托盘程序通过权限检查后才会启动继承该权限的后端。
+- **正向代理兜底**。驱动无法加载时，可以将客户端的 HTTP 代理设为 `127.0.0.1:38457`。
 - **服务模式**：`fastgithub start` / `fastgithub stop` 安装与卸载 Windows 服务。
 - **手动刷新 IP**：访问 `http://127.0.0.1:45678/refresh-ip`。
   该端口由程序按占用情况动态选取（`GlobalListener.UiHttpPort`），
   **以启动日志中打印的实际端口为准**；托盘 UI 会自动使用正确端口。
-- **证书**：首次启动在 `cacert/` 生成自签 CA 并尝试装入「受信任的根证书颁发机构」；
-  非管理员运行会失败并提示手动安装。
+- **证书**。首次启动在 `cacert/` 生成自签 CA 并尝试装入「受信任的根证书颁发机构」。系统证书安装失败后，会尝试当前用户的证书存储。
+
+### Windows 登录自启
+
+1. 以管理员身份将完整程序包解压到受保护的本地目录，例如 `C:\Program Files\FastGithubOps.UI`。普通用户可写的目录无法用于管理员自启。
+2. 使用要自动启动托盘的管理员账户打开 `FastGithub.UI.exe`。在托盘菜单的「设置」中点击「启用自启」。「启动后最小化」可通过「确定」单独保存。
+3. 该管理员账户下次登录 Windows 时，任务计划程序以最高权限启动托盘和后端。首次启用时需要管理员授权，后续登录由 Windows 执行已注册的任务。
+
+从 v2.6.16 等旧版本升级时，在新版设置中点击「迁移旧版自启」。新版在核对计划任务的配置和权限后移除该账户的旧 `HKCU\Run` 项。需要停用时点击「关闭自启」。移动或卸载前先关闭自启，换目录后在新位置重新启用。
+
+### 使用自定义安装目录
+
+自 v2.6.18 起，Windows 直接挂载的 NTFS 卷根按可影响子目录的权限检查。若父目录或安装内容允许普通账户修改，设置会指出未通过检查的那一级。
+
+以 `D:\FastGithubOps.UI` 为例，请用管理员账户创建独立目录。在该目录的「属性 → 安全 → 高级」中禁用继承并将继承的权限转换为显式权限，移除普通账户的修改权限。为 `SYSTEM` 和管理员组保留完全控制，普通用户可保留读取和执行权限。以管理员身份重新解压完整发布包，并确认安装目录和文件的所有者为管理员组，再打开托盘设置启用自启。
+
+如果 `D:\FsTools` 允许普通账户修改，在里面新建安装子目录仍会受到该父目录的限制。可改用 D 盘根下独立的受保护目录。
+
+### 检查登录任务
+
+以管理员身份打开 PowerShell 可核对当前账户的任务。应看到 `Highest`、`Interactive`、登录触发器和完整的程序路径。注销并重新登录后，在任务管理器「详细信息」中打开「已提升」列，确认托盘和后端进程均显示「是」。
+
+```powershell
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$task = Get-ScheduledTask -TaskName "FastGithub.UI-$sid"
+$task.Principal | Select-Object UserId, LogonType, RunLevel
+$task.Triggers | Select-Object UserId, Enabled, CimClass
+$task.Actions | Select-Object Execute, Arguments, WorkingDirectory
+Get-ScheduledTaskInfo -InputObject $task | Select-Object LastRunTime, LastTaskResult
+```
+
+若自启未进入托盘，先查看 `LastTaskResult`。权限不足时会返回 `740`，后端缺失时会返回 `2`。后端路径或启动失败详情可在程序目录的 `logs/ui-error.log` 中查看。
+
+任务在当前管理员账户的交互式登录会话中启动。若使用另一个账户的管理员凭据运行程序，自启任务属于那个管理员账户。相关权限和触发规则见 [Microsoft 任务计划程序文档](https://learn.microsoft.com/en-us/windows/win32/taskschd/security-contexts-for-running-tasks)。
 
 ## 验证记录
 
