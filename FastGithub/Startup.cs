@@ -124,6 +124,7 @@ namespace FastGithub
             services.AddReverseProxy();
             services.AddFlowAnalyze();
             services.AddSingleton<ConnectivityProbe>();
+            services.AddSingleton<GitHubIpPicker>();
             services.AddHostedService<AppHostedService>();
 
             if (OperatingSystem.IsWindows())
@@ -201,6 +202,27 @@ namespace FastGithub
                         ["hostsSource"] = null,
                     });
                 }
+            });
+
+            // 固定 IP 会写盘，只接受托盘从专用回环端口发出的请求。
+            app.MapPost("/pick-github-ip", async (HttpContext context) =>
+            {
+                if (context.Connection.LocalPort != GlobalListener.UiHttpPort ||
+                    context.Connection.RemoteIpAddress is not { } remoteAddress ||
+                    IPAddress.IsLoopback(remoteAddress) == false ||
+                    context.Request.Host.Host != "127.0.0.1" ||
+                    context.Request.Headers["X-FastGithub-UI"] != "1")
+                {
+                    context.Response.StatusCode = StatusCodes.Status404NotFound;
+                    return;
+                }
+
+                var picker = context.RequestServices.GetRequiredService<GitHubIpPicker>();
+                using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, app.Lifetime.ApplicationStopping);
+                var result = await picker.PickAsync(cancellation.Token);
+                context.Response.StatusCode = result.Success ? StatusCodes.Status200OK : StatusCodes.Status409Conflict;
+                context.Response.ContentType = "text/plain; charset=utf-8";
+                await context.Response.WriteAsync(result.Message, context.RequestAborted);
             });
 
             // 【v2.6.4 新增】UI 退出时显式通知主程序停机。

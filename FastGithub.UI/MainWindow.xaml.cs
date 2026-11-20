@@ -40,9 +40,9 @@ namespace FastGithub.UI
             var exit = new System.Windows.Forms.MenuItem("关闭应用(&C)");
             exit.Click += (s, e) => this.ExitAppAsync();
 
-            // 【fork 新增】固定 IP 的自助入口：触发一键选优脚本、打开 IP 配置文件、定位工具目录。
+            // 固定 IP 的自助入口，选优由主程序执行。
             var pickIp = new System.Windows.Forms.MenuItem("重新选优IP(&P)");
-            pickIp.Click += (s, e) => this.RunPickIpScript();
+            pickIp.Click += async (s, e) => await this.PickGitHubIpAsync(pickIp);
 
             var openConfig = new System.Windows.Forms.MenuItem("打开IP配置(&O)");
             openConfig.Click += (s, e) => this.OpenIpConfigFile();
@@ -90,25 +90,41 @@ namespace FastGithub.UI
         }
 
         /// <summary>
-        /// 运行一键选优脚本（pick-fastest-ip.bat）：自动测速选最优 IP 并写入配置。
+        /// 请求主程序探测并更新 GitHub 固定 IP。
         /// </summary>
-        private void RunPickIpScript()
+        private async Task PickGitHubIpAsync(System.Windows.Forms.MenuItem menuItem)
         {
-            var scriptPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "pick-fastest-ip.bat");
-            if (File.Exists(scriptPath) == false)
-            {
-                this.notifyIcon.ShowBalloonTip(5000, FASTGITHUB_UI, "未找到 pick-fastest-ip.bat（需与 FastGithub.UI.exe 同目录）", System.Windows.Forms.ToolTipIcon.Warning);
-                return;
-            }
-
+            menuItem.Enabled = false;
             try
             {
-                Process.Start(new ProcessStartInfo(scriptPath) { UseShellExecute = true });
-                this.notifyIcon.ShowBalloonTip(3000, FASTGITHUB_UI, "已启动选优脚本，请在弹出的窗口中查看进度。", System.Windows.Forms.ToolTipIcon.Info);
+                this.notifyIcon.ShowBalloonTip(3000, FASTGITHUB_UI, "正在探测 GitHub IP，完成后会显示结果。", System.Windows.Forms.ToolTipIcon.Info);
+                using var client = new HttpClient(new HttpClientHandler { UseProxy = false, AllowAutoRedirect = false })
+                {
+                    Timeout = TimeSpan.FromMinutes(5d)
+                };
+                using var request = new HttpRequestMessage(HttpMethod.Post, $"{AppPorts.UiHttpBaseUrl}/pick-github-ip");
+                request.Headers.Add("X-FastGithub-UI", "1");
+                using var response = await client.SendAsync(request);
+                var message = await response.Content.ReadAsStringAsync();
+                if (string.IsNullOrWhiteSpace(message))
+                {
+                    message = $"主程序返回 HTTP {(int)response.StatusCode}，请确认 UI 和主程序使用同一版本。";
+                }
+
+                this.notifyIcon.ShowBalloonTip(5000, FASTGITHUB_UI, message,
+                    response.IsSuccessStatusCode ? System.Windows.Forms.ToolTipIcon.Info : System.Windows.Forms.ToolTipIcon.Warning);
+            }
+            catch (TaskCanceledException)
+            {
+                this.notifyIcon.ShowBalloonTip(5000, FASTGITHUB_UI, "GitHub IP 选优超时，请查看主程序日志。", System.Windows.Forms.ToolTipIcon.Warning);
             }
             catch (Exception ex)
             {
-                this.notifyIcon.ShowBalloonTip(5000, FASTGITHUB_UI, $"启动脚本失败：{ex.Message}", System.Windows.Forms.ToolTipIcon.Error);
+                this.notifyIcon.ShowBalloonTip(5000, FASTGITHUB_UI, $"GitHub IP 选优失败：{ex.Message}", System.Windows.Forms.ToolTipIcon.Error);
+            }
+            finally
+            {
+                menuItem.Enabled = true;
             }
         }
 
@@ -135,7 +151,7 @@ namespace FastGithub.UI
         }
 
         /// <summary>
-        /// 在资源管理器中打开 FastGitHub 程序目录（定位脚本与配置文件）。
+        /// 在资源管理器中打开 FastGitHub 程序目录。
         /// </summary>
         private void OpenToolDirectory()
         {

@@ -41,6 +41,27 @@
 
 `DomainConfig` 新增 `IPAddresses[]`（列表 + 优先级），与单 `IPAddress` 向后兼容、列表优先；`HttpClientHandler.GetIPEndPointsAsync` 按列表顺序 yield，首个连不上由上层串行回退，全部失败再回退动态解析。用于需要固定多个候选 IP 的场景。
 
+### 托盘重新选优
+
+托盘「重新选优IP」调用本机 C# 后端。后端合并四个社区 hosts 源的 `github.com` 地址，沿用域名的 TLS SNI 设置和证书链校验，逐个下载 Git 智能 HTTP 的 `info/refs` 响应。社区候选全部失败时会尝试尚未测过的内置 IP。选优成功后，按下载速率将前 3 个写入 `IPAddresses`，并备份替换前的 `appsettings.github.json`。
+
+```mermaid
+sequenceDiagram
+    participant UI as 托盘
+    participant Core as FastGitHub 后端
+    UI->>Core: 重新选优 IP
+    Core->>Core: 合并候选，逐个探测 Git HTTP
+    opt 社区候选全部失败
+        Core->>Core: 探测内置候选
+    end
+    opt 至少一个候选通过
+        Core->>Core: 备份并原子替换配置
+    end
+    Core-->>UI: 返回选优结果
+```
+
+实机验收时，点击托盘菜单并核对提示、日志和 `IPAddresses`，再通过 FastGitHub 运行真实 `git clone`。`info/refs` 的下载速率用于选 IP，完整 clone 的稳定性仍需实测。
+
 ## 三、UI 非管理员警告（`39f8028` + `190d9c7`）
 
 `app.manifest` 已声明 `requireAdministrator`（正常双击一定提权），但 `start`/脚本/启动器直拉可绕过。此前 `Program.cs` 无运行时检测，后端在 WinDivert 失败时静默降级为 `127.0.0.1:38457` 正向代理，用户无感知。

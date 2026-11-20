@@ -427,29 +427,20 @@ namespace FastGithub.Http
         /// </returns>
         private async ValueTask<(Stream Stream, bool FullyVerified)> ConnectAsync(SocketsHttpConnectionContext context, IPEndPoint ipEndPoint, CancellationToken cancellationToken)
         {
-            var socket = TcpSocketFactory.Create(ipEndPoint.AddressFamily);
-            await socket.ConnectAsync(ipEndPoint, cancellationToken);
-            var stream = new NetworkStream(socket, ownsSocket: true);
-
             var requestContext = context.InitialRequestMessage.GetRequestContext();
+            var stream = await ConnectTcpAsync(ipEndPoint, cancellationToken);
             if (requestContext.IsHttps == false)
             {
                 return (stream, false);
             }
 
             var tlsSniValue = requestContext.TlsSniValue.WithIPAddress(ipEndPoint.Address);
-            var sslStream = new SslStream(stream, leaveInnerStreamOpen: false);
 
             // TLS 握手预算与建连预算联动：若该域名被配置了更长的 ConnectTimeout（如 githubusercontent 25s），
             // 握手自然也该放宽，否则"握手慢但服务正常"的IP会被误杀。
             using var tlsTimeoutSource = new CancellationTokenSource(this.ConnectBudget);
             using var tlsToken = CancellationTokenSource.CreateLinkedTokenSource(tlsTimeoutSource.Token, cancellationToken);
-            await sslStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
-            {
-                TargetHost = tlsSniValue.Value,
-                RemoteCertificateValidationCallback = ValidateServerCertificate
-            }, tlsToken.Token);
-
+            var sslStream = await AuthenticateTlsAsync(stream, tlsSniValue, ValidateServerCertificate, tlsToken.Token);
             return (sslStream, true);
 
             // 验证证书有效性
@@ -465,6 +456,44 @@ namespace FastGithub.Http
                 }
 
                 return IsCertificateAcceptable(errors, ignoreNameMismatch, dnsNameMatches);
+            }
+        }
+
+        internal static async ValueTask<NetworkStream> ConnectTcpAsync(IPEndPoint ipEndPoint, CancellationToken cancellationToken)
+        {
+            var socket = TcpSocketFactory.Create(ipEndPoint.AddressFamily);
+            try
+            {
+                await socket.ConnectAsync(ipEndPoint, cancellationToken);
+                return new NetworkStream(socket, ownsSocket: true);
+            }
+            catch
+            {
+                socket.Dispose();
+                throw;
+            }
+        }
+
+        internal static async ValueTask<SslStream> AuthenticateTlsAsync(
+            NetworkStream stream,
+            TlsSniPattern tlsSniValue,
+            RemoteCertificateValidationCallback validateServerCertificate,
+            CancellationToken cancellationToken)
+        {
+            var sslStream = new SslStream(stream, leaveInnerStreamOpen: false);
+            try
+            {
+                await sslStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+                {
+                    TargetHost = tlsSniValue.Value,
+                    RemoteCertificateValidationCallback = validateServerCertificate
+                }, cancellationToken);
+                return sslStream;
+            }
+            catch
+            {
+                sslStream.Dispose();
+                throw;
             }
         }
 
