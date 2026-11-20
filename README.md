@@ -81,7 +81,7 @@ dotnet build FastGithub.UI/FastGithub.UI.csproj -c Release -m:1 -nr:false
 
 ## 运行
 
-- **Windows 桌面模式**。打开 `FastGithub.UI.exe`，按 Windows 提示确认管理员权限。托盘程序检查实际权限后启动后端，后端继承管理员权限，用于 WinDivert 透明拦截和系统证书安装。
+- **Windows 桌面模式**。打开 `FastGithub.UI.exe`，按 Windows 提示确认管理员权限。主窗口和托盘图标提示会显示当前的管理员运行状态。如果手动启动时程序提示权限不足，可选择以管理员身份重新打开。托盘程序通过权限检查后才会启动继承该权限的后端。
 - **正向代理兜底**。驱动无法加载时，可以将客户端的 HTTP 代理设为 `127.0.0.1:38457`。
 - **服务模式**：`fastgithub start` / `fastgithub stop` 安装与卸载 Windows 服务。
 - **手动刷新 IP**：访问 `http://127.0.0.1:45678/refresh-ip`。

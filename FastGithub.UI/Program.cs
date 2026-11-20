@@ -14,8 +14,10 @@ namespace FastGithub.UI
         private const string MUTEX_NAME = "Global\\FastGithub.UI";
         private const string MAIN_WINDOWS = "MainWindow.xaml";
         internal const string BackendFileName = "fastgithub.exe";
+        private const string ElevationRetryArgument = "--elevation-retry";
         private const int ErrorFileNotFound = 2;
         private const int ElevationRequired = 740;
+        private const int ErrorCancelled = 1223;
 
         [STAThread]
         static void Main(string[] args)
@@ -26,8 +28,7 @@ namespace FastGithub.UI
             {
                 if (scheduledStart == false)
                 {
-                    MessageBox.Show("FastGithub.UI 需要管理员权限。请右键程序，选择「以管理员身份运行」。",
-                        "FastGithub", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    OfferElevation(Array.IndexOf(args, ElevationRetryArgument) >= 0);
                 }
 
                 Environment.ExitCode = ElevationRequired;
@@ -66,6 +67,46 @@ namespace FastGithub.UI
                 WriteUiError("AppDomain.UnhandledException", e.ExceptionObject as Exception, e.IsTerminating);
             app.StartupUri = new Uri(MAIN_WINDOWS, UriKind.Relative);
             app.Run();
+        }
+
+        private static void OfferElevation(bool isRetry)
+        {
+            if (isRetry)
+            {
+                MessageBox.Show("FastGithub.UI 仍未获得管理员权限。请检查 Windows 账户或权限策略。",
+                    "FastGithub", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            var answer = MessageBox.Show("FastGithub.UI 需要管理员权限。是否以管理员身份重新打开？",
+                "FastGithub", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+            if (answer != MessageBoxResult.Yes)
+            {
+                return;
+            }
+
+            // 权限检查发生在取得单实例互斥体和启动后端之前，提权后的实例可以直接完成启动。
+            try
+            {
+                var executablePath = System.Windows.Forms.Application.ExecutablePath;
+                using var process = Process.Start(new ProcessStartInfo
+                {
+                    FileName = executablePath,
+                    WorkingDirectory = Path.GetDirectoryName(executablePath),
+                    Arguments = ElevationRetryArgument,
+                    UseShellExecute = true,
+                    Verb = "runas"
+                });
+            }
+            catch (Win32Exception ex) when (ex.NativeErrorCode == ErrorCancelled)
+            {
+                // 用户取消了 Windows 权限确认，结束本次启动。
+            }
+            catch (Win32Exception ex)
+            {
+                MessageBox.Show($"无法以管理员身份重新打开 FastGithub.UI。{ex.Message}",
+                    "FastGithub", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
         }
 
         private static bool IsOutOfMemory(Exception exception)

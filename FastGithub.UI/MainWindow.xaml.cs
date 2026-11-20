@@ -79,7 +79,7 @@ namespace FastGithub.UI
             this.notifyIcon = new System.Windows.Forms.NotifyIcon
             {
                 Visible = true,
-                Text = FASTGITHUB_UI,
+                Text = $"{FASTGITHUB_UI} · 管理员",
                 ContextMenu = new System.Windows.Forms.ContextMenu(new[]
                     { refreshIp, this.pickIp, this.restoreIp, ipStatus, openConfig, openDir, separator, upgrade, settings, exit }),
                 Icon = System.Drawing.Icon.ExtractAssociatedIcon(System.Windows.Forms.Application.ExecutablePath)

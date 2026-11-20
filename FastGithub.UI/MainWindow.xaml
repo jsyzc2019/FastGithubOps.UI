@@ -143,7 +143,19 @@
         </ResourceDictionary>
     </Window.Resources>
     <Grid Background="#00ffffff">
-        <TabControl Style="{StaticResource TabControlWithUnderLineStyle}" Foreground="Black" Background="Transparent" BorderBrush="Transparent" BorderThickness="0">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <Border Grid.Row="0" Padding="12,6" BorderThickness="0,0,0,1"
+                Background="{DynamicResource {x:Static SystemColors.ControlBrushKey}}"
+                BorderBrush="{DynamicResource {x:Static SystemColors.ControlDarkBrushKey}}">
+            <TextBlock Text="以管理员身份运行" FontSize="12"
+                       Foreground="{DynamicResource {x:Static SystemColors.ControlTextBrushKey}}"/>
+        </Border>
+
+        <TabControl Grid.Row="1" Style="{StaticResource TabControlWithUnderLineStyle}" Foreground="Black" Background="Transparent" BorderBrush="Transparent" BorderThickness="0">
             <TabItem Style="{StaticResource TabItemExWithUnderLineStyle}" Header="流量" Height="40" Width="60"  Margin="5 0" FontSize="18">
                 <Grid Background="#f7f7f7">
                     <local:FlowChart Margin="16" />
