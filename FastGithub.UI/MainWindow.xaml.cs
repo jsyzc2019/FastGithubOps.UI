@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Configuration;
 using System.Diagnostics;
+using System.IO;
 using System.Net.Http;
 using System.Reflection;
 using System.Threading.Tasks;
@@ -39,13 +40,25 @@ namespace FastGithub.UI
             var exit = new System.Windows.Forms.MenuItem("关闭应用(&C)");
             exit.Click += (s, e) => this.ExitAppAsync();
 
+            // 【fork 新增】固定 IP 的自助入口：触发一键选优脚本、打开 IP 配置文件、定位工具目录。
+            var pickIp = new System.Windows.Forms.MenuItem("重新选优IP(&P)");
+            pickIp.Click += (s, e) => this.RunPickIpScript();
+
+            var openConfig = new System.Windows.Forms.MenuItem("打开IP配置(&O)");
+            openConfig.Click += (s, e) => this.OpenIpConfigFile();
+
+            var openDir = new System.Windows.Forms.MenuItem("打开工具目录(&D)");
+            openDir.Click += (s, e) => this.OpenToolDirectory();
+
+            var separator = new System.Windows.Forms.MenuItem("-");
+
             var version = this.GetType().Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
             this.Title = $"{FASTGITHUB_UI} v{version}";
             this.notifyIcon = new System.Windows.Forms.NotifyIcon
             {
                 Visible = true,
                 Text = FASTGITHUB_UI,
-                ContextMenu = new System.Windows.Forms.ContextMenu(new[] { refreshIp, upgrade, settings, exit }),
+                ContextMenu = new System.Windows.Forms.ContextMenu(new[] { refreshIp, pickIp, openConfig, openDir, separator, upgrade, settings, exit }),
                 Icon = System.Drawing.Icon.ExtractAssociatedIcon(System.Windows.Forms.Application.ExecutablePath)
             };
 
@@ -73,6 +86,66 @@ namespace FastGithub.UI
                     FASTGITHUB_UI,
                     "未以管理员身份运行，透明拦截已降级为正向代理，加速效果受限。",
                     System.Windows.Forms.ToolTipIcon.Warning);
+            }
+        }
+
+        /// <summary>
+        /// 运行一键选优脚本（pick-fastest-ip.bat）：自动测速选最优 IP 并写入配置。
+        /// </summary>
+        private void RunPickIpScript()
+        {
+            var scriptPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "pick-fastest-ip.bat");
+            if (File.Exists(scriptPath) == false)
+            {
+                this.notifyIcon.ShowBalloonTip(5000, FASTGITHUB_UI, "未找到 pick-fastest-ip.bat（需与 FastGithub.UI.exe 同目录）", System.Windows.Forms.ToolTipIcon.Warning);
+                return;
+            }
+
+            try
+            {
+                Process.Start(new ProcessStartInfo(scriptPath) { UseShellExecute = true });
+                this.notifyIcon.ShowBalloonTip(3000, FASTGITHUB_UI, "已启动选优脚本，请在弹出的窗口中查看进度。", System.Windows.Forms.ToolTipIcon.Info);
+            }
+            catch (Exception ex)
+            {
+                this.notifyIcon.ShowBalloonTip(5000, FASTGITHUB_UI, $"启动脚本失败：{ex.Message}", System.Windows.Forms.ToolTipIcon.Error);
+            }
+        }
+
+        /// <summary>
+        /// 用记事本打开 IP 配置文件（appsettings/appsettings.github.json）。
+        /// </summary>
+        private void OpenIpConfigFile()
+        {
+            var configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "appsettings", "appsettings.github.json");
+            if (File.Exists(configPath) == false)
+            {
+                this.notifyIcon.ShowBalloonTip(5000, FASTGITHUB_UI, "未找到 appsettings/appsettings.github.json", System.Windows.Forms.ToolTipIcon.Warning);
+                return;
+            }
+
+            try
+            {
+                Process.Start(new ProcessStartInfo("notepad.exe", $"\"{configPath}\"") { UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                this.notifyIcon.ShowBalloonTip(5000, FASTGITHUB_UI, $"打开配置失败：{ex.Message}", System.Windows.Forms.ToolTipIcon.Error);
+            }
+        }
+
+        /// <summary>
+        /// 在资源管理器中打开 FastGitHub 程序目录（定位脚本与配置文件）。
+        /// </summary>
+        private void OpenToolDirectory()
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo("explorer.exe", $"\"{AppDomain.CurrentDomain.BaseDirectory}\"") { UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                this.notifyIcon.ShowBalloonTip(5000, FASTGITHUB_UI, $"打开目录失败：{ex.Message}", System.Windows.Forms.ToolTipIcon.Error);
             }
         }
 
