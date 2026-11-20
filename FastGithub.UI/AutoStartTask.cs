@@ -199,10 +199,10 @@ namespace FastGithub.UI
             var action = GetOnlyChild(task.Element(ns + "Actions"), ns + "Exec");
             var settings = task.Element(ns + "Settings");
 
-            return (string?)principal?.Element(ns + "UserId") == sid &&
+            return IsSameUser((string?)principal?.Element(ns + "UserId"), sid) &&
                 (string?)principal?.Element(ns + "LogonType") == "InteractiveToken" &&
                 (string?)principal?.Element(ns + "RunLevel") == "HighestAvailable" &&
-                (string?)trigger?.Element(ns + "UserId") == sid &&
+                IsSameUser((string?)trigger?.Element(ns + "UserId"), sid) &&
                 (bool?)trigger?.Element(ns + "Enabled") != false &&
                 trigger?.Element(ns + "StartBoundary") == null &&
                 trigger?.Element(ns + "EndBoundary") == null &&
@@ -215,6 +215,29 @@ namespace FastGithub.UI
                 (bool?)settings?.Element(ns + "RunOnlyIfIdle") != true &&
                 (bool?)settings?.Element(ns + "RunOnlyIfNetworkAvailable") != true &&
                 (string?)settings?.Element(ns + "ExecutionTimeLimit") == "PT0S";
+        }
+
+        private static bool IsSameUser(string? userId, string sid)
+        {
+            if (string.Equals(userId, sid, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            if (string.IsNullOrWhiteSpace(userId))
+            {
+                return false;
+            }
+
+            try
+            {
+                // 保存任务时 Windows 可能把登录触发器的 SID 转为计算机名或域限定的账户名。
+                return new NTAccount(userId).Translate(typeof(SecurityIdentifier)).Value == sid;
+            }
+            catch (IdentityNotMappedException)
+            {
+                return false;
+            }
         }
 
         private static XElement? GetOnlyChild(XElement? parent, XName name)
