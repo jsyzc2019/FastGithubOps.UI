@@ -2,7 +2,7 @@
 .SYNOPSIS
   一键测速选出 GitHub 最优 IP，并自动写入 FastGitHub 配置。
 .DESCRIPTION
-  对 GitHub 官方 IP 逐个测 git 协议真实吞吐（HTTP 200 且吞吐最大者最优），
+  从社区 hosts 源多源拉取 github.com 候选 IP（失败回退内置官方段），再逐个测 git 协议真实吞吐，
   自动备份并写入 appsettings.github.json 的 github.com.IPAddresses（吞吐前 3，按优先级降序）。
   用途：固定 IP 失效或变慢时，双击运行即可换新 IP，无需手改配置文件。
 .NOTES
@@ -26,13 +26,57 @@ if (-not (Test-Path $configFile)) {
 }
 Write-Host "配置文件: $configFile"
 
-# ---- 2. 候选 IP（GitHub 官方 git/web 段，可自行增删）----
-$candidates = @(
+# ---- 2. 候选 IP：多源动态拉取 github.com 的 IP + 硬编码兜底 ----
+# 兜底池：所有源不可达时使用（GitHub 官方 git/web 段，可自行增删）
+$fallbackCandidates = @(
     "20.6.7.16","20.6.7.17","20.27.163.208","20.205.243.166","20.207.73.82",
     "140.82.112.3","140.82.112.4","140.82.113.3","140.82.113.4",
     "140.82.114.3","140.82.114.4","140.82.121.3","140.82.121.4",
     "57.155.223.240","172.182.252.130"
 )
+
+# 社区 IP 源（按优先级），每个源只需提取 github.com 对应的 IP
+$sources = @(
+    @{ Name = "GitHub520";       Url = "https://raw.hellogithub.com/hosts.json"; Type = "json" },
+    @{ Name = "FetchGHHosts";    Url = "https://hosts.gitcdn.top/hosts.txt";      Type = "text" },
+    @{ Name = "GitHub-IP-hosts"; Url = "https://cdn.jsdelivr.net/gh/ittuann/GitHub-IP-hosts@main/hosts"; Type = "text" },
+    @{ Name = "gh-hosts";        Url = "https://gitee.com/fliu2476/github-hosts/raw/main/hosts"; Type = "text" }
+)
+
+# 从所有源拉取 github.com 的 IP，合并去重；每个源独立失败不影响其他源
+function Get-GithubComIPs {
+    $ips = [System.Collections.Generic.List[string]]::new()
+    foreach ($src in $sources) {
+        try {
+            $body = & curl.exe -s --max-time 10 -A "Mozilla/5.0" $src.Url 2>$null
+            if ($LASTEXITCODE -ne 0 -or -not $body) { throw "拉取失败" }
+            if ($src.Type -eq "json") {
+                $arr = $body | ConvertFrom-Json
+                foreach ($item in $arr) {
+                    if ($item[1] -eq "github.com") { $ips.Add([string]$item[0]) }
+                }
+            } else {
+                foreach ($line in ($body -split "`n")) {
+                    if ($line -match "^\s*(\d{1,3}(\.\d{1,3}){3})\s+github\.com\s*$") {
+                        $ips.Add($Matches[1])
+                    }
+                }
+            }
+            Write-Host ("  [源] {0} 命中" -f $src.Name) -ForegroundColor Green
+        } catch {
+            Write-Host ("  [源] {0} 不可达，跳过" -f $src.Name) -ForegroundColor DarkGray
+        }
+    }
+    return $ips
+}
+
+$candidates = @(Get-GithubComIPs | Select-Object -Unique)
+if (-not $candidates -or $candidates.Count -eq 0) {
+    Write-Host "所有源不可达，回退到硬编码候选池（$($fallbackCandidates.Count) 个）" -ForegroundColor Yellow
+    $candidates = $fallbackCandidates
+} else {
+    Write-Host ("多源合并得到 {0} 个 github.com 候选 IP" -f $candidates.Count)
+}
 
 # ---- 3. 测速 ----
 Write-Host ""
