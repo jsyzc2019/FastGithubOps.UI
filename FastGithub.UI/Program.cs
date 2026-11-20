@@ -35,6 +35,29 @@ namespace FastGithub.UI
                 SetAutoStart(false);
             }
 
+            // 未以管理员身份运行时给出明确警告：透明拦截（DNS 劫持 + WinDivert 内核驱动）
+            // 需要管理员权限；否则后端会降级为 38457 正向代理，加速大打折扣。
+            // app.manifest 已声明 requireAdministrator，正常双击一定提权；此检测是防
+            // 绕过 manifest 启动（start 命令/脚本直拉）时的兜底。
+            if (IsAdministrator() == false)
+            {
+                var answer = System.Windows.MessageBox.Show(
+                    "FastGithub 检测到当前未以管理员身份运行。\n\n" +
+                    "透明拦截（DNS 劫持 + WinDivert 内核驱动）需要管理员权限，\n" +
+                    "当前只能以降级模式（正向代理）运行，加速效果受限。\n\n" +
+                    "建议：关闭后右键 FastGithub.UI.exe 选择「以管理员身份运行」。\n\n" +
+                    "是否仍要继续以降级模式运行？",
+                    "FastGithub",
+                    System.Windows.MessageBoxButton.YesNo,
+                    System.Windows.MessageBoxImage.Warning,
+                    System.Windows.MessageBoxResult.No);
+
+                if (answer != System.Windows.MessageBoxResult.Yes)
+                {
+                    return;
+                }
+            }
+
             StartFastGithub();
             SetWebBrowserDPI();
             SetWebBrowserVersion();
@@ -75,6 +98,18 @@ namespace FastGithub.UI
             {
                 // 落盘失败不影响异常兜底
             }
+        }
+
+        /// <summary>
+        /// 当前进程是否以管理员身份运行（已提升 token）。
+        /// <para>UAC 下 split token 不含 Administrators 组，此判断能区分「已提升」与「普通权限」，
+        /// 契合 WinDivert 内核驱动对管理员权限的要求。</para>
+        /// </summary>
+        public static bool IsAdministrator()
+        {
+            using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+            var principal = new System.Security.Principal.WindowsPrincipal(identity);
+            return principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
         }
 
         /// <summary>
