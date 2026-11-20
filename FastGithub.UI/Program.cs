@@ -1,5 +1,6 @@
 ﻿using Microsoft.Win32;
 using System;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
@@ -13,6 +14,7 @@ namespace FastGithub.UI
         private const string MUTEX_NAME = "Global\\FastGithub.UI";
         private const string MAIN_WINDOWS = "MainWindow.xaml";
         internal const string BackendFileName = "fastgithub.exe";
+        private const int ErrorFileNotFound = 2;
         private const int ElevationRequired = 740;
 
         [STAThread]
@@ -39,9 +41,10 @@ namespace FastGithub.UI
                 return;
             }
 
-            if (StartFastGithub(scheduledStart) == false && scheduledStart)
+            var backendStartResult = StartFastGithub(scheduledStart);
+            if (scheduledStart && backendStartResult != 0)
             {
-                Environment.ExitCode = 2; // ERROR_FILE_NOT_FOUND
+                Environment.ExitCode = backendStartResult;
                 return;
             }
 
@@ -165,17 +168,13 @@ namespace FastGithub.UI
         /// <summary>
         /// 启动继承当前管理员令牌的后端进程。
         /// </summary>
-        private static bool StartFastGithub(bool scheduledStart)
+        private static int StartFastGithub(bool scheduledStart)
         {
             var fastgithubPath = FindFastGithubPath(allowDevelopmentBuild: scheduledStart == false);
             if (fastgithubPath == null)
             {
-                if (scheduledStart == false)
-                {
-                    MessageBox.Show($"未找到 {BackendFileName}，请确认它与 FastGithub.UI.exe 在同一目录下。",
-                        "FastGithub", MessageBoxButton.OK, MessageBoxImage.Error);
-                }
-                return false;
+                var error = new FileNotFoundException($"未找到 {BackendFileName}，请确认它与 FastGithub.UI.exe 在同一目录下。");
+                return ReportBackendStartFailure(scheduledStart, error, ErrorFileNotFound);
             }
 
             var startInfo = new ProcessStartInfo
@@ -186,8 +185,26 @@ namespace FastGithub.UI
                 UseShellExecute = false,
                 CreateNoWindow = true
             };
-            using var process = Process.Start(startInfo);
-            return process != null;
+            try
+            {
+                // UseShellExecute 为 false 时直接创建进程。启动失败时 Windows 会提供原生错误码。
+                using var process = Process.Start(startInfo);
+                return 0;
+            }
+            catch (Win32Exception ex)
+            {
+                return ReportBackendStartFailure(scheduledStart, ex, ex.NativeErrorCode);
+            }
+        }
+
+        private static int ReportBackendStartFailure(bool scheduledStart, Exception error, int exitCode)
+        {
+            WriteUiError("StartFastGithub", error, terminating: scheduledStart);
+            if (scheduledStart == false)
+            {
+                MessageBox.Show(error.Message, "FastGithub", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            return exitCode;
         }
 
         /// <summary>

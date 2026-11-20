@@ -2,6 +2,7 @@ using Microsoft.Win32;
 using System;
 using System.IO;
 using System.Linq;
+using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Xml.Linq;
 
@@ -17,6 +18,7 @@ namespace FastGithub.UI
         private const int CreateOrUpdate = 0x6;
         private const int DontAddPrincipalAce = 0x10;
         private const int InteractiveToken = 3;
+        private const int ReadOwnerAndDacl = 0x5;
         private const string TaskSecurity = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
         private static readonly XNamespace TaskNamespace = "http://schemas.microsoft.com/windows/2004/02/mit/task";
 
@@ -29,29 +31,25 @@ namespace FastGithub.UI
             NeedsUpdate
         }
 
-        internal static Status ReadStatus()
+        internal static Status ReadStatus(string executablePath)
         {
             using var identity = WindowsIdentity.GetCurrent();
             var sid = GetUserSid(identity);
-            var folder = OpenTaskFolder();
-            var xml = ReadEnabledTaskXml(folder, TaskPrefix + sid);
-            using var runKey = Registry.CurrentUser.OpenSubKey(RunKey);
-            var hasLegacyEntry = runKey?.GetValue(LegacyRunValue) != null;
-
-            if (xml == null)
+            var status = ReadTaskStatus(OpenTaskFolder(), sid, executablePath);
+            if (HasLegacyEntry() == false)
             {
-                return hasLegacyEntry ? Status.LegacyEntry : Status.Off;
+                return status;
             }
 
-            if (Matches(xml, sid, System.Windows.Forms.Application.ExecutablePath) == false)
+            return status switch
             {
-                return Status.NeedsUpdate;
-            }
-
-            return hasLegacyEntry ? Status.EnabledWithLegacyEntry : Status.Enabled;
+                Status.Off => Status.LegacyEntry,
+                Status.Enabled => Status.EnabledWithLegacyEntry,
+                _ => status
+            };
         }
 
-        internal static void SetEnabled(bool enabled)
+        internal static void SetEnabled(bool enabled, string executablePath)
         {
             if (Program.IsAdministrator() == false)
             {
@@ -62,33 +60,38 @@ namespace FastGithub.UI
             var sid = GetUserSid(identity);
             var taskName = TaskPrefix + sid;
             var folder = OpenTaskFolder();
-            using var runKey = Registry.CurrentUser.OpenSubKey(RunKey, writable: true);
 
             if (enabled)
             {
-                var executablePath = System.Windows.Forms.Application.ExecutablePath;
                 AutoStartInstallPath.Validate(executablePath);
-                var xml = ReadEnabledTaskXml(folder, taskName);
-                if (xml == null || Matches(xml, sid, executablePath) == false)
+                if (ReadTaskStatus(folder, sid, executablePath) != Status.Enabled)
                 {
                     // 任务由计划程序管理，仅 SYSTEM 和已提升的管理员可修改。交互登录无需保存密码。
                     ((dynamic)folder).RegisterTask(taskName, BuildXml(sid, executablePath),
                         CreateOrUpdate | DontAddPrincipalAce, sid, null, InteractiveToken, TaskSecurity);
-                    xml = ReadEnabledTaskXml(folder, taskName);
-                    if (xml == null || Matches(xml, sid, executablePath) == false)
+                    if (ReadTaskStatus(folder, sid, executablePath) != Status.Enabled)
                     {
                         throw new InvalidOperationException("计划任务回读结果与登录自启设置不一致。");
                     }
                 }
-
-                // 新任务生效后才删除旧入口，注册失败时保留已有设置。
-                runKey?.DeleteValue(LegacyRunValue, throwOnMissingValue: false);
             }
             else
             {
-                runKey?.DeleteValue(LegacyRunValue, throwOnMissingValue: false);
                 DeleteTask(folder, taskName);
             }
+
+            // 启用时先确认新任务。关闭时先撤销高权限入口，再清理旧项。
+            if (HasLegacyEntry())
+            {
+                using var runKey = Registry.CurrentUser.OpenSubKey(RunKey, writable: true);
+                runKey?.DeleteValue(LegacyRunValue, throwOnMissingValue: false);
+            }
+        }
+
+        private static bool HasLegacyEntry()
+        {
+            using var runKey = Registry.CurrentUser.OpenSubKey(RunKey);
+            return runKey?.GetValueNames().Contains(LegacyRunValue, StringComparer.OrdinalIgnoreCase) == true;
         }
 
         private static string GetUserSid(WindowsIdentity identity)
@@ -103,17 +106,49 @@ namespace FastGithub.UI
             return scheduler.GetFolder(@"\");
         }
 
-        private static string? ReadEnabledTaskXml(object folder, string taskName)
+        private static Status ReadTaskStatus(object folder, string sid, string executablePath)
         {
             try
             {
-                dynamic task = ((dynamic)folder).GetTask(taskName);
-                return (bool)task.Enabled ? (string)task.Xml : null;
+                dynamic task = ((dynamic)folder).GetTask(TaskPrefix + sid);
+                if ((bool)task.Enabled == false)
+                {
+                    return Status.Off;
+                }
+
+                return Matches((string)task.Xml, sid, executablePath) &&
+                    HasProtectedSecurity((string)task.GetSecurityDescriptor(ReadOwnerAndDacl))
+                    ? Status.Enabled : Status.NeedsUpdate;
             }
             catch (Exception ex) when (ex.HResult == TaskNotFound)
             {
-                return null;
+                return Status.Off;
             }
+        }
+
+        private static bool HasProtectedSecurity(string sddl)
+        {
+            var descriptor = new RawSecurityDescriptor(sddl);
+            var acl = descriptor.DiscretionaryAcl;
+            if (descriptor.Owner?.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid) != true ||
+                (descriptor.ControlFlags & ControlFlags.DiscretionaryAclProtected) == 0 || acl?.Count != 2)
+            {
+                return false;
+            }
+
+            var grantsAdmin = false;
+            var grantsSystem = false;
+            foreach (var entry in acl)
+            {
+                if (entry is CommonAce ace && ace.AceQualifier == AceQualifier.AccessAllowed &&
+                    ace.AceFlags == AceFlags.None && ace.AccessMask == (int)FileSystemRights.FullControl)
+                {
+                    grantsAdmin |= ace.SecurityIdentifier.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid);
+                    grantsSystem |= ace.SecurityIdentifier.IsWellKnown(WellKnownSidType.LocalSystemSid);
+                }
+            }
+
+            return grantsAdmin && grantsSystem;
         }
 
         private static void DeleteTask(object folder, string taskName)
@@ -174,6 +209,7 @@ namespace FastGithub.UI
                 string.Equals((string?)action?.Element(ns + "Command"), executablePath, StringComparison.OrdinalIgnoreCase) &&
                 (string?)action?.Element(ns + "Arguments") == StartupArgument &&
                 string.Equals((string?)action?.Element(ns + "WorkingDirectory"), Path.GetDirectoryName(executablePath), StringComparison.OrdinalIgnoreCase) &&
+                (string?)settings?.Element(ns + "MultipleInstancesPolicy") == "IgnoreNew" &&
                 (bool?)settings?.Element(ns + "DisallowStartIfOnBatteries") == false &&
                 (bool?)settings?.Element(ns + "StopIfGoingOnBatteries") == false &&
                 (bool?)settings?.Element(ns + "RunOnlyIfIdle") != true &&

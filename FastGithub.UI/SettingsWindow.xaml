@@ -8,11 +8,16 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
-        <CheckBox x:Name="AutoStartCheckBox" Content="登录时以管理员身份启动" Grid.Row="0"/>
-        <TextBlock x:Name="AutoStartHint" Grid.Row="1" TextWrapping="Wrap" Margin="18,4,0,12"
+        <TextBlock Text="登录时以管理员身份启动" FontWeight="SemiBold"/>
+        <TextBlock x:Name="AutoStartHint" Grid.Row="1" TextWrapping="Wrap" Margin="0,4,0,8"
                    Foreground="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}"/>
-        <CheckBox x:Name="StartMinimizedCheckBox" Content="启动后最小化" Grid.Row="2" Margin="0,0,0,12"/>
-        <Button Content="确定" Grid.Row="3" HorizontalAlignment="Right" Width="75" Click="OkButton_Click"/>
+        <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,16">
+            <Button x:Name="EnableAutoStartButton" MinWidth="86" Margin="0,0,8,0" Padding="6,2" Click="EnableAutoStartButton_Click"/>
+            <Button x:Name="DisableAutoStartButton" Content="关闭自启" MinWidth="86" Padding="6,2" Click="DisableAutoStartButton_Click"/>
+        </StackPanel>
+        <CheckBox x:Name="StartMinimizedCheckBox" Content="启动后最小化" Grid.Row="3" Margin="0,0,0,12"/>
+        <Button Content="确定" Grid.Row="4" HorizontalAlignment="Right" Width="75" Click="OkButton_Click"/>
     </Grid>
 </Window>

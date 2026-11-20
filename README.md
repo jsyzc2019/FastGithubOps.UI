@@ -92,10 +92,10 @@ dotnet build FastGithub.UI/FastGithub.UI.csproj -c Release -m:1 -nr:false
 ### Windows 登录自启
 
 1. 以管理员身份将完整程序包解压到受保护的本地目录，例如 `C:\Program Files\FastGithubOps.UI`。普通用户可写的目录无法用于管理员自启。
-2. 使用要自动启动托盘的管理员账户打开 `FastGithub.UI.exe`。在托盘菜单的「设置」勾选「登录时以管理员身份启动」，点击「确定」。也可同时开启「启动后最小化」。
+2. 使用要自动启动托盘的管理员账户打开 `FastGithub.UI.exe`。在托盘菜单的「设置」中点击「启用自启」。「启动后最小化」可通过「确定」单独保存。
 3. 该管理员账户下次登录 Windows 时，任务计划程序以最高权限启动托盘和后端。首次启用时需要管理员授权，后续登录由 Windows 执行已注册的任务。
 
-从 v2.6.16 等旧版本升级时，在新版设置中勾选并保存一次。新版在确认计划任务已注册后移除该账户的旧 `HKCU\Run` 项。取消勾选并保存可关闭自启。移动或卸载前先关闭自启，换目录后在新位置重新启用。
+从 v2.6.16 等旧版本升级时，在新版设置中点击「迁移旧版自启」。新版在核对计划任务的配置和权限后移除该账户的旧 `HKCU\Run` 项。需要停用时点击「关闭自启」。移动或卸载前先关闭自启，换目录后在新位置重新启用。
 
 以管理员身份打开 PowerShell 可核对当前账户的任务。应看到 `Highest`、`Interactive`、登录触发器和完整的程序路径。注销并重新登录后，在任务管理器「详细信息」中打开「已提升」列，确认托盘和后端进程均显示「是」。
 
@@ -105,7 +105,10 @@ $task = Get-ScheduledTask -TaskName "FastGithub.UI-$sid"
 $task.Principal | Select-Object UserId, LogonType, RunLevel
 $task.Triggers | Select-Object UserId, Enabled, CimClass
 $task.Actions | Select-Object Execute, Arguments, WorkingDirectory
+Get-ScheduledTaskInfo -InputObject $task | Select-Object LastRunTime, LastTaskResult
 ```
+
+若自启未进入托盘，先查看 `LastTaskResult`。权限不足时会返回 `740`，后端缺失时会返回 `2`。后端路径或启动失败详情可在程序目录的 `logs/ui-error.log` 中查看。
 
 任务在当前管理员账户的交互式登录会话中启动。若使用另一个账户的管理员凭据运行程序，自启任务属于那个管理员账户。相关权限和触发规则见 [Microsoft 任务计划程序文档](https://learn.microsoft.com/en-us/windows/win32/taskschd/security-contexts-for-running-tasks)。
 
