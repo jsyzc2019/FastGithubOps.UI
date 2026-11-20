@@ -35,7 +35,8 @@ namespace FastGithub.UI
         {
             using var identity = WindowsIdentity.GetCurrent();
             var sid = GetUserSid(identity);
-            var status = ReadTaskStatus(OpenTaskFolder(), sid, executablePath);
+            var task = FindTask(OpenTaskFolder(), TaskPrefix + sid);
+            var status = ReadTaskStatus(task, sid, executablePath);
             if (HasLegacyEntry() == false)
             {
                 return status;
@@ -64,12 +65,18 @@ namespace FastGithub.UI
             if (enabled)
             {
                 AutoStartInstallPath.Validate(executablePath);
-                if (ReadTaskStatus(folder, sid, executablePath) != Status.Enabled)
+                var existingTask = FindTask(folder, taskName);
+                if (ReadTaskStatus(existingTask, sid, executablePath) != Status.Enabled)
                 {
                     // 任务由计划程序管理，仅 SYSTEM 和已提升的管理员可修改。交互登录无需保存密码。
+                    if (existingTask != null)
+                    {
+                        // RegisterTask 更新已有定义时保留实际 ACL，先收紧 ACL 再更新任务。
+                        ((dynamic)existingTask).SetSecurityDescriptor(TaskSecurity, DontAddPrincipalAce);
+                    }
                     ((dynamic)folder).RegisterTask(taskName, BuildXml(sid, executablePath),
                         CreateOrUpdate | DontAddPrincipalAce, sid, null, InteractiveToken, TaskSecurity);
-                    if (ReadTaskStatus(folder, sid, executablePath) != Status.Enabled)
+                    if (ReadTaskStatus(FindTask(folder, taskName), sid, executablePath) != Status.Enabled)
                     {
                         throw new InvalidOperationException("计划任务回读结果与登录自启设置不一致。");
                     }
@@ -106,24 +113,34 @@ namespace FastGithub.UI
             return scheduler.GetFolder(@"\");
         }
 
-        private static Status ReadTaskStatus(object folder, string sid, string executablePath)
+        private static object? FindTask(object folder, string taskName)
         {
             try
             {
-                dynamic task = ((dynamic)folder).GetTask(TaskPrefix + sid);
-                if ((bool)task.Enabled == false)
-                {
-                    return Status.Off;
-                }
-
-                return Matches((string)task.Xml, sid, executablePath) &&
-                    HasProtectedSecurity((string)task.GetSecurityDescriptor(ReadOwnerAndDacl))
-                    ? Status.Enabled : Status.NeedsUpdate;
+                return ((dynamic)folder).GetTask(taskName);
             }
             catch (Exception ex) when (ex.HResult == TaskNotFound)
             {
+                return null;
+            }
+        }
+
+        private static Status ReadTaskStatus(object? registeredTask, string sid, string executablePath)
+        {
+            if (registeredTask == null)
+            {
                 return Status.Off;
             }
+
+            dynamic task = registeredTask;
+            if ((bool)task.Enabled == false)
+            {
+                return Status.Off;
+            }
+
+            return Matches((string)task.Xml, sid, executablePath) &&
+                HasProtectedSecurity((string)task.GetSecurityDescriptor(ReadOwnerAndDacl))
+                ? Status.Enabled : Status.NeedsUpdate;
         }
 
         private static bool HasProtectedSecurity(string sddl)
