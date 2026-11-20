@@ -25,6 +25,9 @@ namespace FastGithub.Http
         private readonly DomainConfig domainConfig;
         private readonly IDomainResolver domainResolver;
         private readonly ILogger<HttpClientHandler>? logger;
+        private readonly GitHubConnectionStatus? gitHubConnectionStatus;
+
+        private readonly record struct ConnectionCandidate(IPAddress Address, bool IsFixed);
 
         // 默认单IP建连预算（TCP+TLS）。跨境链路 RTT 差异极大：github.com 交互请求常在 5s 左右，
         // 而 raw.githubusercontent.com / codeload.github.com 这类承载大文件、git 对象的域名
@@ -72,10 +75,17 @@ namespace FastGithub.Http
         /// <param name="domainConfig"></param>
         /// <param name="domainResolver"></param> 
         public HttpClientHandler(DomainConfig domainConfig, IDomainResolver domainResolver, ILogger<HttpClientHandler>? logger = null)
+            : this(domainConfig, domainResolver, logger, null)
+        {
+        }
+
+        internal HttpClientHandler(DomainConfig domainConfig, IDomainResolver domainResolver,
+            ILogger<HttpClientHandler>? logger, GitHubConnectionStatus? gitHubConnectionStatus)
         {
             this.domainConfig = domainConfig;
             this.domainResolver = domainResolver;
             this.logger = logger;
+            this.gitHubConnectionStatus = gitHubConnectionStatus;
             this.InnerHandler = this.CreateSocketsHttpHandler();
         }
 
@@ -240,20 +250,31 @@ namespace FastGithub.Http
         {
             var innerExceptions = new List<Exception>();
             var seen = new HashSet<IPAddress>();
-            var blacklisted = new List<IPEndPoint>();
+            var blacklisted = new List<ConnectionCandidate>();
             var attempted = 0;
 
             IPAddress.TryParse(endPoint.Host, out var literalAddress);
-            var fixedAddresses = literalAddress != null ? new[] { literalAddress } : this.GetFixedAddresses();
-            var fixedCandidates = fixedAddresses.Select(AdmitCandidate).OfType<IPEndPoint>().Take(MAX_TRY_COUNT).ToArray();
-            var dynamicCandidates = new List<IPEndPoint>();
+            var fixedAddresses = literalAddress != null ? new[] { literalAddress } : this.domainConfig.GetFixedAddresses();
+            var fixedCandidates = new List<ConnectionCandidate>(MAX_TRY_COUNT);
+            foreach (var address in fixedAddresses)
+            {
+                if (AdmitCandidate(address, isFixed: true) is { } candidate)
+                {
+                    fixedCandidates.Add(candidate);
+                    if (fixedCandidates.Count == MAX_TRY_COUNT)
+                    {
+                        break;
+                    }
+                }
+            }
+            var dynamicCandidates = new List<ConnectionCandidate>();
 
             if (fixedAddresses.Length == 0)
             {
                 // 普通域名沿用原有解析和建连顺序。
                 await foreach (var address in this.domainResolver.ResolveAsync(endPoint, cancellationToken))
                 {
-                    if (AdmitCandidate(address) is { } candidate)
+                    if (AdmitCandidate(address, isFixed: false) is { } candidate)
                     {
                         dynamicCandidates.Add(candidate);
                     }
@@ -267,7 +288,7 @@ namespace FastGithub.Http
             // 固定地址先尝试。按候选数为动态回退预留一个时间片，IP 字面量独享拨号时间。
             var fixedDeadline = literalAddress != null
                 ? totalConnectBudget
-                : totalConnectBudget * fixedCandidates.Length / (fixedCandidates.Length + 1);
+                : totalConnectBudget * fixedCandidates.Count / (fixedCandidates.Count + 1);
             if (await TryConnectAsync(fixedCandidates, fixedDeadline) is { } fixedStream)
             {
                 return fixedStream;
@@ -298,7 +319,7 @@ namespace FastGithub.Http
 
                     foreach (var address in resolved)
                     {
-                        if (AdmitCandidate(address) is { } candidate)
+                        if (AdmitCandidate(address, isFixed: false) is { } candidate)
                         {
                             dynamicCandidates.Add(candidate);
                         }
@@ -307,7 +328,7 @@ namespace FastGithub.Http
             }
 
             // 只有固定和动态池起初都没有可用地址时，才恢复对黑名单内地址的试探。
-            if (fixedCandidates.Length == 0 && dynamicCandidates.Count == 0)
+            if (fixedCandidates.Count == 0 && dynamicCandidates.Count == 0)
             {
                 dynamicCandidates.AddRange(blacklisted);
             }
@@ -334,14 +355,14 @@ namespace FastGithub.Http
             _ = this.RefreshIpAsync(endPoint.Host);
             throw new AggregateException("找不到任何可成功连接的IP，已自动触发IP更新，请稍后重试", innerExceptions);
 
-            IPEndPoint? AdmitCandidate(IPAddress address)
+            ConnectionCandidate? AdmitCandidate(IPAddress address, bool isFixed)
             {
                 if (seen.Add(address) == false)
                 {
                     return null;
                 }
 
-                var candidate = new IPEndPoint(address, endPoint.Port);
+                var candidate = new ConnectionCandidate(address, isFixed);
                 if (this.domainResolver.IsBlacklisted(endPoint, address))
                 {
                     blacklisted.Add(candidate);
@@ -352,9 +373,9 @@ namespace FastGithub.Http
                 return candidate;
             }
 
-            async ValueTask<Stream?> TryConnectAsync(IPEndPoint[] candidates, TimeSpan deadline, bool isFallback = false)
+            async ValueTask<Stream?> TryConnectAsync(IReadOnlyList<ConnectionCandidate> candidates, TimeSpan deadline, bool isFallback = false)
             {
-                for (var index = 0; index < candidates.Length; index++)
+                for (var index = 0; index < candidates.Count; index++)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     var remainingBudget = deadline - Stopwatch.GetElapsedTime(startedAt);
@@ -364,7 +385,7 @@ namespace FastGithub.Http
                     }
 
                     // 每次拨号均分该阶段的剩余时间，慢候选给后续候选留出尝试机会。
-                    var slice = remainingBudget / (candidates.Length - index);
+                    var slice = remainingBudget / (candidates.Count - index);
                     var budget = this.ConnectBudget < slice ? this.ConnectBudget : slice;
                     var candidate = candidates[index];
 
@@ -373,14 +394,15 @@ namespace FastGithub.Http
                         using var attemptTimeout = CancellationTokenSource.CreateLinkedTokenSource(totalTokenSource.Token);
                         attemptTimeout.CancelAfter(budget);
                         attempted++;
-                        var (stream, verified) = await connect(candidate, attemptTimeout.Token);
+                        var (stream, verified) = await connect(new IPEndPoint(candidate.Address, endPoint.Port), attemptTimeout.Token);
 
                         // HTTPS 完成 TLS 验证后才回写健康度。纯 HTTP 建连保持中性。
                         if (verified)
                         {
                             this.domainResolver.ReportSuccess(endPoint, candidate.Address);
+                            this.gitHubConnectionStatus?.Record(endPoint.Host, candidate.Address, candidate.IsFixed, fixedAddresses.Length > 0);
                         }
-                        if (isFallback)
+                        if (isFallback && candidate.IsFixed == false)
                         {
                             this.logger?.LogInformation("{Host} 固定 IP 建连失败，已使用动态地址 {Address}", endPoint.Host, candidate.Address);
                         }
@@ -580,19 +602,6 @@ namespace FastGithub.Http
             }
 
             return errors == System.Net.Security.SslPolicyErrors.None;
-        }
-
-        /// <summary>
-        /// 读取用户配置的固定地址，列表优先于旧的单 IP 字段。
-        /// </summary>
-        private IPAddress[] GetFixedAddresses()
-        {
-            if (this.domainConfig.IPAddresses is { Length: > 0 } addresses)
-            {
-                return addresses.OfType<IPAddress>().ToArray();
-            }
-
-            return this.domainConfig.IPAddress is { } address ? new[] { address } : Array.Empty<IPAddress>();
         }
 
         /// <summary>

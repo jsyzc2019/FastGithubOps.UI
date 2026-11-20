@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Linq;
 using System.Net;
 
 namespace FastGithub.Configuration
@@ -64,6 +65,19 @@ namespace FastGithub.Configuration
         /// 自定义响应
         /// </summary>
         public ResponseConfig? Response { get; init; }
+
+        /// <summary>
+        /// 读取用于拨号的固定地址，列表优先于旧的单 IP 字段。
+        /// </summary>
+        public IPAddress[] GetFixedAddresses()
+        {
+            if (this.IPAddresses is { Length: > 0 } addresses)
+            {
+                return addresses.OfType<IPAddress>().ToArray();
+            }
+
+            return this.IPAddress is { } address ? new[] { address } : Array.Empty<IPAddress>();
+        }
 
         /// <summary>
         /// 获取TlsSniPattern

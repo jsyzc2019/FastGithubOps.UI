@@ -16,6 +16,7 @@ namespace FastGithub
         /// <returns></returns>
         public static IServiceCollection AddHttpClient(this IServiceCollection services)
         {
+            services.TryAddSingleton<GitHubConnectionStatus>();
             services.TryAddSingleton<IHttpClientFactory, HttpClientFactory>();
             return services;
         }

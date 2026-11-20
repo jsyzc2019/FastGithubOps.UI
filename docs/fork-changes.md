@@ -62,6 +62,10 @@ sequenceDiagram
     Core-->>UI: 返回选优结果
 ```
 
+- 托盘「恢复GitHub自动选路」备份配置并清除旧版 `IPAddress` 和 `IPAddresses` 中的固定地址。另有配置源提供固定地址时，托盘会提示需要继续处理该来源。
+
+- 托盘「查看GitHub建连状态」显示当前加载的选路配置，以及本次启动以来最近一次 GitHub HTTPS 成功建连的 IP、来源和时间。来源区分固定配置、自动选路和动态回退。
+
 实机验收时，点击托盘菜单并核对提示、日志和 `IPAddresses`，再通过 FastGitHub 运行真实 `git clone`。`info/refs` 的下载速率用于选 IP，完整 clone 的稳定性仍需实测。
 
 ## 三、UI 非管理员警告（`39f8028` + `190d9c7`）

@@ -12,6 +12,7 @@ namespace FastGithub.Http
     sealed class HttpClientFactory : IHttpClientFactory
     {
         private readonly IDomainResolver domainResolver;
+        private readonly GitHubConnectionStatus gitHubConnectionStatus;
         private readonly ILogger<HttpClientHandler> handlerLogger;
 
         /// <summary>
@@ -39,9 +40,10 @@ namespace FastGithub.Http
         /// HttpClient工厂
         /// </summary>
         /// <param name="domainResolver"></param>
-        public HttpClientFactory(IDomainResolver domainResolver, ILoggerFactory loggerFactory)
+        public HttpClientFactory(IDomainResolver domainResolver, GitHubConnectionStatus gitHubConnectionStatus, ILoggerFactory loggerFactory)
         {
             this.domainResolver = domainResolver;
+            this.gitHubConnectionStatus = gitHubConnectionStatus;
             this.handlerLogger = loggerFactory.CreateLogger<HttpClientHandler>();
         }
 
@@ -71,7 +73,8 @@ namespace FastGithub.Http
         /// <returns></returns>
         private LifetimeHttpHandler CreateLifetimeHttpHandler(LifeTimeKey lifeTimeKey, TimeSpan lifeTime)
         {
-            return new LifetimeHttpHandler(this.domainResolver, lifeTimeKey, lifeTime, this.OnLifetimeHttpHandlerDeactivate, this.handlerLogger);
+            return new LifetimeHttpHandler(this.domainResolver, lifeTimeKey, lifeTime, this.OnLifetimeHttpHandlerDeactivate,
+                this.handlerLogger, this.gitHubConnectionStatus);
         }
 
         /// <summary>

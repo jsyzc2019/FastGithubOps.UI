@@ -2,6 +2,7 @@ using FastGithub.Configuration;
 using FastGithub.DomainResolve;
 using FastGithub.FlowAnalyze;
 using FastGithub.Diagnostics;
+using FastGithub.Http;
 using FastGithub.HttpServer.Certs;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -204,25 +205,24 @@ namespace FastGithub
                 }
             });
 
-            // 固定 IP 会写盘，只接受托盘从专用回环端口发出的请求。
-            app.MapPost("/pick-github-ip", async (HttpContext context) =>
+            // GitHub 选路和状态入口仅供托盘通过专用回环端口调用。
+            app.MapPost("/pick-github-ip", (HttpContext context) =>
+                UpdateGitHubIpAsync(context, restoreAutomatic: false, app.Lifetime.ApplicationStopping));
+            app.MapPost("/restore-github-ip", (HttpContext context) =>
+                UpdateGitHubIpAsync(context, restoreAutomatic: true, app.Lifetime.ApplicationStopping));
+            app.MapGet("/github-ip-status", async (HttpContext context) =>
             {
-                if (context.Connection.LocalPort != GlobalListener.UiHttpPort ||
-                    context.Connection.RemoteIpAddress is not { } remoteAddress ||
-                    IPAddress.IsLoopback(remoteAddress) == false ||
-                    context.Request.Host.Host != "127.0.0.1" ||
-                    context.Request.Headers["X-FastGithub-UI"] != "1")
+                if (IsGitHubTrayRequest(context) == false)
                 {
                     context.Response.StatusCode = StatusCodes.Status404NotFound;
                     return;
                 }
 
                 var picker = context.RequestServices.GetRequiredService<GitHubIpPicker>();
-                using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, app.Lifetime.ApplicationStopping);
-                var result = await picker.PickAsync(cancellation.Token);
-                context.Response.StatusCode = result.Success ? StatusCodes.Status200OK : StatusCodes.Status409Conflict;
+                var latest = context.RequestServices.GetRequiredService<GitHubConnectionStatus>().Latest;
+                context.Response.Headers.CacheControl = "no-store";
                 context.Response.ContentType = "text/plain; charset=utf-8";
-                await context.Response.WriteAsync(result.Message, context.RequestAborted);
+                await context.Response.WriteAsync(picker.DescribeStatus(latest), context.RequestAborted);
             });
 
             // 【v2.6.4 新增】UI 退出时显式通知主程序停机。
@@ -323,6 +323,31 @@ namespace FastGithub
                     items = results
                 }, context.RequestAborted);
             });
+        }
+
+        private static async Task UpdateGitHubIpAsync(HttpContext context, bool restoreAutomatic, CancellationToken appStopping)
+        {
+            if (IsGitHubTrayRequest(context) == false)
+            {
+                context.Response.StatusCode = StatusCodes.Status404NotFound;
+                return;
+            }
+
+            var picker = context.RequestServices.GetRequiredService<GitHubIpPicker>();
+            using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, appStopping);
+            var result = await picker.UpdateAsync(restoreAutomatic, cancellation.Token);
+            context.Response.StatusCode = result.Success ? StatusCodes.Status200OK : StatusCodes.Status409Conflict;
+            context.Response.ContentType = "text/plain; charset=utf-8";
+            await context.Response.WriteAsync(result.Message, context.RequestAborted);
+        }
+
+        private static bool IsGitHubTrayRequest(HttpContext context)
+        {
+            return context.Connection.LocalPort == GlobalListener.UiHttpPort &&
+                context.Connection.RemoteIpAddress is { } remoteAddress &&
+                IPAddress.IsLoopback(remoteAddress) &&
+                context.Request.Host.Host == "127.0.0.1" &&
+                context.Request.Headers["X-FastGithub-UI"] == "1";
         }
     }
 }

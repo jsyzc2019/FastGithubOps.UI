@@ -26,20 +26,29 @@ namespace FastGithub.Http
             };
             var dynamicAddress = IPAddress.Parse("192.0.2.20");
 
-            var failed = VerifyOrder("固定 IP 成功时直接返回",
-                new DomainConfig { IPAddress = fixedAddresses[0] }, fixedAddresses[0], new[] { dynamicAddress },
+            var failed = VerifyConnection("固定 IP 成功时直接返回并记录固定来源",
+                new DomainConfig { IPAddress = fixedAddresses[0] }, fixedAddresses[0], new[] { dynamicAddress }, null,
+                GitHubConnectionSource.Fixed,
                 $"拨号 {fixedAddresses[0]}");
-            failed += VerifyOrder("三个固定 IP 均失败时尝试去重后的动态地址",
+            failed += VerifyConnection("三个固定 IP 均失败时尝试去重后的动态地址",
                 new DomainConfig { IPAddresses = fixedAddresses }, dynamicAddress, new[] { fixedAddresses[0], dynamicAddress },
+                null, GitHubConnectionSource.DynamicFallback,
                 $"拨号 {fixedAddresses[0]}", $"拨号 {fixedAddresses[1]}", $"拨号 {fixedAddresses[2]}", "动态解析", $"拨号 {dynamicAddress}");
+            failed += VerifyConnection("固定地址被跳过时仍显示动态回退",
+                new DomainConfig { IPAddresses = fixedAddresses }, dynamicAddress, new[] { dynamicAddress },
+                fixedAddresses, GitHubConnectionSource.DynamicFallback, "动态解析", $"拨号 {dynamicAddress}");
+            failed += VerifyConnection("没有固定地址时显示自动选路",
+                new DomainConfig(), dynamicAddress, new[] { dynamicAddress }, null,
+                GitHubConnectionSource.Dynamic, "动态解析", $"拨号 {dynamicAddress}");
             return failed;
         }
 
-        private static int VerifyOrder(string name, DomainConfig config, IPAddress reachable,
-            IPAddress[] resolved, params string[] expected)
+        private static int VerifyConnection(string name, DomainConfig config, IPAddress reachable,
+            IPAddress[] resolved, IPAddress[]? blacklisted, GitHubConnectionSource source, params string[] expected)
         {
             var steps = new List<string>();
-            using var handler = new HttpClientHandler(config, new ResolverStub(steps, resolved));
+            var status = new GitHubConnectionStatus();
+            using var handler = new HttpClientHandler(config, new ResolverStub(steps, resolved, blacklisted), null, status);
             try
             {
                 using var stream = handler.ConnectWithCandidatesAsync(new DnsEndPoint("github.com", 443), Connect, CancellationToken.None)
@@ -51,8 +60,9 @@ namespace FastGithub.Http
                 return 1;
             }
 
-            var passed = steps.SequenceEqual(expected);
-            Console.WriteLine(passed ? $"  OK   {name}" : $"  FAIL {name}（实际顺序 {string.Join("、", steps)}）");
+            var latest = status.Latest;
+            var passed = steps.SequenceEqual(expected) && latest != null && latest.Address.Equals(reachable) && latest.Source == source;
+            Console.WriteLine(passed ? $"  OK   {name}" : $"  FAIL {name}（实际顺序 {string.Join("、", steps)}，记录 {latest}）");
             return passed ? 0 : 1;
 
             ValueTask<(Stream Stream, bool FullyVerified)> Connect(IPEndPoint endPoint, CancellationToken token)
@@ -65,7 +75,7 @@ namespace FastGithub.Http
             }
         }
 
-        private sealed class ResolverStub(List<string> steps, IPAddress[] resolved) : IDomainResolver
+        private sealed class ResolverStub(List<string> steps, IPAddress[] resolved, IPAddress[]? blacklisted) : IDomainResolver
         {
             public async IAsyncEnumerable<IPAddress> ResolveAsync(
                 DnsEndPoint endPoint, [EnumeratorCancellation] CancellationToken cancellationToken = default)
@@ -79,7 +89,7 @@ namespace FastGithub.Http
                 }
             }
 
-            public bool IsBlacklisted(DnsEndPoint endPoint, IPAddress address) => false;
+            public bool IsBlacklisted(DnsEndPoint endPoint, IPAddress address) => blacklisted?.Contains(address) == true;
 
             public void ReportSuccess(DnsEndPoint endPoint, IPAddress address) { }
 
