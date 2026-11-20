@@ -24,6 +24,8 @@ namespace FastGithub.Diagnostics
     internal sealed class GitHubIpPicker
     {
         private const string Host = "github.com";
+        private const int TargetAddressCount = 3;
+        private static readonly TimeSpan supplementTimeout = TimeSpan.FromSeconds(30d);
         private const string ConfigPath = "appsettings/appsettings.github.json";
         private const string DomainConfigKey = "FastGithub:DomainConfigs:" + Host;
         private static readonly string[] sourceUrls =
@@ -126,17 +128,8 @@ namespace FastGithub.Diagnostics
             var sourceCandidates = await Task.WhenAll(
                 sourceUrls.Select(url => this.FetchCandidatesAsync(sourceClient, url, cancellationToken)));
 
-            var seen = new HashSet<IPAddress>();
-            var candidates = sourceCandidates.SelectMany(addresses => addresses)
-                .Select(address => address.IsIPv4MappedToIPv6 ? address.MapToIPv4() : address)
-                .Where(seen.Add)
-                .ToArray();
-            var selected = await this.ProbeAsync(candidates, domainConfig, cancellationToken);
-            if (selected.Length == 0)
-            {
-                this.logger.LogInformation("社区来源没有可用的 GitHub IP，尝试内置候选");
-                selected = await this.ProbeAsync(fallbackAddresses.Where(seen.Add), domainConfig, cancellationToken);
-            }
+            var selected = await SelectAddressesAsync(sourceCandidates.SelectMany(addresses => addresses), fallbackAddresses,
+                (address, token) => this.MeasureCandidateAsync(address, domainConfig, token), cancellationToken);
 
             if (selected.Length == 0)
             {
@@ -145,8 +138,9 @@ namespace FastGithub.Diagnostics
 
             var backup = this.SaveAddresses(selected, cancellationToken);
             var result = string.Join("、", selected.Select(address => address.ToString()));
-            this.logger.LogInformation("已写入 GitHub 固定 IP {Addresses}，配置备份 {Backup}", result, backup);
-            return (true, $"已更新 GitHub 固定 IP：{result}");
+            this.logger.LogInformation("已写入 GitHub 固定 IP，通过 {Count}/{Target} {Addresses}，配置备份 {Backup}",
+                selected.Length, TargetAddressCount, result, backup);
+            return (true, $"已更新 GitHub 固定 IP（通过 {selected.Length}/{TargetAddressCount}）：{result}");
         }
 
         private (bool Success, string Message) RestoreAutomatic(CancellationToken cancellationToken)
@@ -222,34 +216,88 @@ namespace FastGithub.Diagnostics
             }
         }
 
-        private async Task<IPAddress[]> ProbeAsync(
-            IEnumerable<IPAddress> candidates, DomainConfig domainConfig, CancellationToken cancellationToken)
+        private async Task<double?> MeasureCandidateAsync(
+            IPAddress address, DomainConfig domainConfig, CancellationToken cancellationToken)
         {
-            var measured = new List<(IPAddress Address, double BytesPerSecond)>();
-            // 串行下载，避免候选相互争抢带宽而扭曲速率排序。
-            foreach (var address in candidates)
+            try
             {
-                try
+                var speed = await GitHubIpProbe.MeasureAsync(address, domainConfig, cancellationToken);
+                if (speed is double bytesPerSecond)
                 {
-                    var speed = await GitHubIpProbe.MeasureAsync(address, domainConfig, cancellationToken);
-                    if (speed is double bytesPerSecond)
-                    {
-                        measured.Add((address, bytesPerSecond));
-                        this.logger.LogInformation("GitHub IP {Address} 探测通过，下载速率 {Speed:F0} 字节/秒", address, bytesPerSecond);
-                    }
-                    else
-                    {
-                        this.logger.LogInformation("GitHub IP {Address} 未返回完整的 Git 智能 HTTP 响应", address);
-                    }
+                    this.logger.LogInformation("GitHub IP {Address} info/refs 探测通过，含建连的平均响应速率 {Speed:F0} 字节/秒",
+                        address, bytesPerSecond);
                 }
-                catch (Exception ex) when ((ex is HttpRequestException or IOException or OperationCanceledException) &&
-                    cancellationToken.IsCancellationRequested == false)
+                else
                 {
-                    this.logger.LogInformation("GitHub IP {Address} 探测失败（{Reason}）", address, ex.Message);
+                    this.logger.LogInformation("GitHub IP {Address} 未返回完整的 Git 智能 HTTP 响应", address);
                 }
+                return speed;
+            }
+            catch (Exception ex) when (ex is HttpRequestException or IOException or OperationCanceledException)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                this.logger.LogInformation("GitHub IP {Address} 探测失败（{Reason}）", address, ex.Message);
+                return null;
+            }
+        }
+
+        internal static async Task<IPAddress[]> SelectAddressesAsync(
+            IEnumerable<IPAddress> community, IEnumerable<IPAddress> fallback,
+            Func<IPAddress, CancellationToken, Task<double?>> measure, CancellationToken cancellationToken)
+        {
+            var seen = new HashSet<IPAddress>();
+            var selected = await RankAsync(community, TargetAddressCount, false, cancellationToken);
+            var missing = TargetAddressCount - selected.Length;
+            if (missing == 0)
+            {
+                return selected;
             }
 
-            return measured.OrderByDescending(item => item.BytesPerSecond).Take(3).Select(item => item.Address).ToArray();
+            // 保留已通过的社区候选顺序。社区全部失败时仍测完整内置池。
+            using var supplementBudget = selected.Length > 0
+                ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+                : null;
+            supplementBudget?.CancelAfter(supplementTimeout);
+            var extra = await RankAsync(fallback, missing, supplementBudget != null,
+                supplementBudget?.Token ?? cancellationToken);
+            return selected.Concat(extra).ToArray();
+
+            async Task<IPAddress[]> RankAsync(IEnumerable<IPAddress> candidates, int limit, bool stopWhenFull, CancellationToken token)
+            {
+                var measured = new List<(IPAddress Address, double Rate)>();
+                // 串行探测，避免候选相互争抢带宽。
+                foreach (var candidate in candidates)
+                {
+                    if (token.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    var address = candidate.IsIPv4MappedToIPv6 ? candidate.MapToIPv4() : candidate;
+                    if (seen.Add(address) == false)
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        if (await measure(address, token) is double rate)
+                        {
+                            measured.Add((address, rate));
+                            if (stopWhenFull && measured.Count == limit)
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    catch (OperationCanceledException) when (token.IsCancellationRequested && cancellationToken.IsCancellationRequested == false)
+                    {
+                        break;
+                    }
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                return measured.OrderByDescending(item => item.Rate).Take(limit).Select(item => item.Address).ToArray();
+            }
         }
 
         private string? SaveAddresses(IPAddress[] selected, CancellationToken cancellationToken)

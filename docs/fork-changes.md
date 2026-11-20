@@ -7,8 +7,8 @@
 
 | commit | 文件 | 改动 | 解决的根因 |
 | --- | --- | --- | --- |
-| `b21e4c0` | `FastGithub/appsettings/appsettings.github.json` | github.com `Timeout` 25s→90s（配置级） | 大 pack 传输被 25s 整体预算砍断 |
-| `4a28e4c` | `FastGithub.Http/TelemetryPolicy.cs` | 新增 `IsGitSmartHttpRequest` + `GitTimeout=10min`，git 智能协议请求独立宽松超时 | 同上（源码级根治，替代 `b21e4c0` 的配置放宽） |
+| `b21e4c0` | `FastGithub/appsettings/appsettings.github.json` | github.com `Timeout` 25s→90s（配置级） | 给慢请求更多时间等待上游响应头 |
+| `4a28e4c` | `FastGithub.Http/TelemetryPolicy.cs` | Git 智能 HTTP 独立使用至少 10 分钟的响应头等待预算 | 替代 `b21e4c0` 对全部 github.com 请求的统一放宽 |
 | `9274068` | `FastGithub.Configuration/DomainConfig.cs` | 新增 `IPAddresses[]` 列表字段（与单 `IPAddress` 兼容、列表优先） | 单 IP 无法固定多个候选 |
 | `2e8ad45` | `FastGithub.Http/HttpClientHandler.cs` | 建连候选支持固定 IP 列表按序回退 | 同上 |
 | `39f8028` | `FastGithub.UI/Program.cs` | 启动时检测管理员权限，非管理员弹窗警告 | 非管理员静默降级、用户无感知 |
@@ -27,14 +27,14 @@
 | `20.6.7.17` | 200 | 200 | **16.7 KB/s** ✅ |
 | `140.82.113.4`（传统段） | 200 | 200 | 4.4 KB/s |
 
-两层根因：
+复核关注两个环节。
 
 1. **探测指标不足**：FastGitHub 的 IP 探测只做 TCP 握手（`IPAddressService.GetAddressElapsedAsync`，注释明确为防风控放弃 TLS），但「TCP/网页通 ≠ git 协议通」。上表中 `57.155.223.240` 建连快却被排到候选首位，git clone 一连上就卡死。注意：该 IP 经 `gh api meta` 核实为 GitHub **官方**段，不是污染 IP。
-2. **整体预算砍断大 pack**：`github.com.Timeout=25s` 是「建连+传输+下载」的整体预算，大 pack 在跨境链路上需数分钟，25s 一到被 `CancellationToken` 砍断 → `unexpected disconnect while reading sideband packet` / `invalid index-pack output`。
+2. **等待上游响应头**。`DomainConfig.Timeout` 的计时在上游响应头返回时结束。YARP 继续管理正文转发，默认空闲超时 100 秒且有读写进展时会续期。失败日志记录 `ForwarderError`、响应是否已开始和请求取消状态，供区分请求阶段与传输阶段。
 
 ### 修复
 
-- **源码级（`4a28e4c`）**：`TelemetryPolicy.LimitTimeout` 对 git 智能协议请求（路径后缀 `info/refs` / `git-upload-pack` / `git-receive-pack`）单独放宽到 10 分钟；普通请求仍按域名默认预算快速失败。配置级 `b21e4c0` 的 90s 因此被取代（运行实例可回退为默认 25s，由代码自动放宽 git 请求）。
+- **源码级（`4a28e4c`）**。Git 智能 HTTP 的 `info/refs`、`git-upload-pack` 和 `git-receive-pack` 至少有 10 分钟等待上游响应头。普通请求沿用域名预算。
 - **配置级（运行实例）**：给 `github.com` 加 `"IPAddress": "20.6.7.17"`（实测 git 协议吞吐最优的官方 IP），`DomainConfig.IPAddress` 建连时优先尝试，失败后再尝试动态解析。
 
 ## 二、固定 IP 列表（`9274068` + `2e8ad45`）
@@ -45,7 +45,7 @@
 
 ### 托盘重新选优
 
-托盘「重新选优IP」调用本机 C# 后端。后端合并四个社区 hosts 源的 `github.com` 地址，沿用域名的 TLS SNI 设置和证书链校验，逐个下载 Git 智能 HTTP 的 `info/refs` 响应。社区候选全部失败时会尝试尚未测过的内置 IP。选优成功后，按下载速率将前 3 个写入 `IPAddresses`，并备份替换前的 `appsettings.github.json`。
+托盘「重新选优IP」合并四个社区 hosts 源的 `github.com` 地址，沿用域名 TLS 配置探测 `info/refs`。社区候选通过不足 3 个时，保留已通过的顺序，最多用 30 秒从未试过的内置地址补足。社区候选全失败时，遍历内置池并按同一指标选优。结果会显示通过数量，备份后只写入通过探测的地址。
 
 ```mermaid
 sequenceDiagram
@@ -53,8 +53,8 @@ sequenceDiagram
     participant Core as FastGitHub 后端
     UI->>Core: 重新选优 IP
     Core->>Core: 合并候选，逐个探测 Git HTTP
-    opt 社区候选全部失败
-        Core->>Core: 探测内置候选
+    opt 社区候选通过不足三个
+        Core->>Core: 补测未试过的内置地址
     end
     opt 至少一个候选通过
         Core->>Core: 备份并原子替换配置
@@ -66,13 +66,15 @@ sequenceDiagram
 
 - 托盘「查看GitHub建连状态」显示当前加载的选路配置，以及本次启动以来最近一次 GitHub HTTPS 成功建连的 IP、来源和时间。来源区分固定配置、自动选路和动态回退。
 
-实机验收时，点击托盘菜单并核对提示、日志和 `IPAddresses`，再通过 FastGitHub 运行真实 `git clone`。`info/refs` 的下载速率用于选 IP，完整 clone 的稳定性仍需实测。
+实机验收时，核对托盘提示、日志和 `IPAddresses`，再通过 FastGitHub 运行真实 `git clone`。`info/refs` 的平均响应速率包含建连和等待，适合候选排序。完整 clone 的吞吐需使用实际传输字节和时长。
 
 ## 三、UI 非管理员警告（`39f8028` + `190d9c7`）
 
 `app.manifest` 已声明 `requireAdministrator`（正常双击一定提权），但 `start`/脚本/启动器直拉可绕过。此前 `Program.cs` 无运行时检测，后端在 WinDivert 失败时静默降级为 `127.0.0.1:38457` 正向代理，用户无感知。
 
 修复：`Program.IsAdministrator()` 检测（`WindowsIdentity`/`WindowsPrincipal`，注意 UI 工程为 `net45`，类型在 `System.Security.Principal` 命名空间而非 .NET Core 的 `.Windows`）；非管理员时弹窗「继续降级/退出」（默认退出）+ 托盘气泡二次提醒。
+
+WPF 遇到内存耗尽时走默认异常退出路径，`ui-error.log` 记录 PID 和终止状态。后端通过父进程退出监测进行清理。
 
 ## 验证结果（2026-11-20 实测）
 
@@ -83,7 +85,8 @@ sequenceDiagram
 | `git-upload-pack`（小请求） | 24.9s 险超时 | 357ms |
 | clone 结果 | 反复失败 | 连续 2 次成功（exit 0） |
 | clone 耗时 | 失败 | 9.3s / 10s |
-| 吞吐 | ~20 KB/s | ~6.4 MB/s（≈320 倍） |
+
+两次浅 clone 完成时，检出目录合计 64 MB。该大小由 `.git` 和工作区共同构成。
 
 编译：后端 `.NET 10`（6 个 warning 均为原有代码）、UI `net45`（0 警告 0 错误）。
 

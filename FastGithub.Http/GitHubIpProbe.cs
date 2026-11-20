@@ -19,7 +19,8 @@ namespace FastGithub.Http
         private static readonly Uri probeUri = new("http://github.com/git/git.git/info/refs?service=git-upload-pack");
 
         /// <summary>
-        /// 返回完整下载的平均速率（字节/秒）。响应不符合 Git 智能 HTTP 时返回空值。
+        /// 返回从开始建连到完整读取 info/refs 的平均响应速率（字节/秒）。
+        /// 响应不符合 Git 智能 HTTP 时返回空值。
         /// </summary>
         public static async Task<double?> MeasureAsync(IPAddress address, DomainConfig config, CancellationToken cancellationToken)
         {

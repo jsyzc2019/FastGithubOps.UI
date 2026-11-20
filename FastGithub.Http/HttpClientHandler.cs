@@ -112,20 +112,7 @@ namespace FastGithub.Http
             request.Headers.Host = uri.Host;
             request.RequestUri = new UriBuilder(uri) { Scheme = Uri.UriSchemeHttp }.Uri;
 
-            // 整体请求预算（建连+传输+下载），按域名可覆盖；未设置则不限制单请求总时长。
-            // <para>
-            // 【为什么必须恢复这一层】v2.5.5 为避免"慢 IP 被误杀"把各域名的 Timeout 全部移除，
-            // 只保留 ConnectTimeout。副作用是失败请求失去整体上限：不可路由的 IP 会走完
-            // TCP SYN 重传（本机实测约 21s），串行候选再叠加负载，最慢一条达到 99.5s
-            // （日志实测慢 502 的 p50=51s、max=99.5s），YARP 把它映射成 502 返回，
-            // 用户观感是"网页卡死一分多钟"。
-            // </para>
-            // <para>
-            // 注意：这里的 Timeout 不是 HttpClient.Timeout——本项目的转发客户端
-            // FastGithub.Http.HttpClient 继承 HttpMessageInvoker，本身没有 Timeout 属性，
-            // 也不经过 IHttpClientFactory。该预算是转发链路上唯一有效的整体上限，
-            // 因此配置时不能省略。
-            // </para>
+            // 域名请求预算覆盖建连和等待上游响应头。收到响应头后，YARP 用自身的活动超时管理正文转发。
             CancellationToken effectiveToken = cancellationToken;
             // 【v2.6.14 P1】遥测 beacon 用 8s fail-fast 预算（其余按域名配置）。
             // 见 TelemetryPolicy：504 里 66% 是 stats/collect beacon，它们吃满 25~30s

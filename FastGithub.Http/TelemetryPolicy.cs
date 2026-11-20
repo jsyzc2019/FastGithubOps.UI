@@ -7,7 +7,7 @@ namespace FastGithub.Http
     /// <para>
     /// 遥测上报（beacon）：GitHub 的页面会持续发送统计 beacon（<c>collector.github.com/github/collect</c>、
     /// <c>api.github.com/_private/browser/rum|stats</c>）。它们对**用户无任何价值**：
-    /// 浏览器不等结果、失败也不影响页面。但当前配置会让它们吃满域名的整体预算
+    /// 浏览器不等结果、失败也不影响页面。但当前配置会让它们吃满域名的等待预算
     /// （api.github.com = 25s，collector 走 *.github.com = 30s）。
     /// </para>
     /// <para>
@@ -17,11 +17,9 @@ namespace FastGithub.Http
     /// 本来就会丢的 beacon。
     /// </para>
     /// <para>
-    /// git 智能协议（fork 改动）：git clone/pull/push 的大 pack 传输远超域名默认的整体预算
-    /// （github.com = 25s），会在传输中途被 CancellationToken 砍断，表现为
-    /// <c>unexpected disconnect while reading sideband packet</c> / <c>invalid index-pack output</c>。
-    /// 故对 <c>info/refs</c> / <c>git-upload-pack</c> / <c>git-receive-pack</c> 单独放宽到
-    /// <see cref="GitTimeout"/>（10 分钟）。详见 <see cref="IsGitSmartHttpRequest"/>。
+    /// Git 智能协议（fork 改动）：服务端准备 pack 时可能较慢。
+    /// <c>info/refs</c>、<c>git-upload-pack</c> 和 <c>git-receive-pack</c> 独立放宽为
+    /// <see cref="GitTimeout"/>（10 分钟）。该预算持续到收到上游响应头，正文转发由 YARP 管理。
     /// </para>
     /// </summary>
     public static class TelemetryPolicy
@@ -32,15 +30,7 @@ namespace FastGithub.Http
         public static readonly TimeSpan TelemetryTimeout = TimeSpan.FromSeconds(8d);
 
         /// <summary>
-        /// git 智能 HTTP 协议请求的预算。
-        /// <para>
-        /// git clone/pull/push 走 <c>info/refs</c> + <c>git-upload-pack</c> / <c>git-receive-pack</c>，
-        /// 大 pack 在跨境链路（约 20 KB/s）下需数分钟传输，而域名默认的整体预算
-        /// （github.com = 25s）会在传输中途用 CancellationToken 砍断连接，
-        /// 表现为 <c>unexpected disconnect while reading sideband packet</c> /
-        /// <c>invalid index-pack output</c>。给 git 请求一个独立、宽松的预算，
-        /// 普通请求仍保持短超时快速失败。
-        /// </para>
+        /// Git 智能 HTTP 请求从建连到收到上游响应头的默认预算。
         /// </summary>
         public static readonly TimeSpan GitTimeout = TimeSpan.FromMinutes(10d);
 
@@ -117,11 +107,10 @@ namespace FastGithub.Http
         }
 
         /// <summary>
-        /// 给出实际生效的请求预算：遥测请求最多 8 秒，git 智能协议请求放宽到 10 分钟，
-        /// 其余按域名配置原样返回。
+        /// 给出等待上游响应头的请求预算。遥测请求最多 8 秒，Git 智能协议请求至少 10 分钟，
+        /// 其余使用域名配置。
         /// <para>
-        /// 只收紧、不放松：域名已配置了更小的超时（如 5s）时保留配置值，
-        /// 避免"策略"反而把预算调大。
+        /// 遥测请求优先保留域名配置中的更短时限。
         /// </para>
         /// </summary>
         /// <param name="uri">请求地址</param>
@@ -136,8 +125,7 @@ namespace FastGithub.Http
                     : TelemetryTimeout;
             }
 
-            // git 智能协议：放宽到 GitTimeout（若域名配置更大则保留配置），
-            // 避免大 pack 传输被域名默认整体预算中途砍断。
+            // Git 智能协议等待上游响应头时，保留更宽的请求预算。
             if (IsGitSmartHttpRequest(uri))
             {
                 return configured.HasValue && configured.Value > GitTimeout

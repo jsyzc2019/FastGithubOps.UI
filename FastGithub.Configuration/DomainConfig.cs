@@ -40,7 +40,7 @@ namespace FastGithub.Configuration
         public IPAddress[]? IPAddresses { get; init; }
 
         /// <summary>
-        /// 请求超时时长（整体：建连+传输+下载的总预算）
+        /// 建连和等待上游响应头的请求预算。
         /// </summary>
         public TimeSpan? Timeout { get; init; }
 
