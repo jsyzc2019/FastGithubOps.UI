@@ -11,8 +11,11 @@
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
         <TextBlock Text="登录时以管理员身份启动" FontWeight="SemiBold"/>
-        <TextBlock x:Name="AutoStartHint" Grid.Row="1" TextWrapping="Wrap" Margin="0,4,0,8"
-                   Foreground="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}"/>
+        <StackPanel Grid.Row="1" Margin="0,4,0,8">
+            <TextBlock x:Name="AutoStartHint" TextWrapping="Wrap"
+                       Foreground="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}"/>
+            <TextBlock x:Name="AutoStartDirectoryHint" TextWrapping="Wrap" Margin="0,4,0,0"/>
+        </StackPanel>
         <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,16">
             <Button x:Name="EnableAutoStartButton" MinWidth="86" Margin="0,0,8,0" Padding="6,2" Click="EnableAutoStartButton_Click"/>
             <Button x:Name="DisableAutoStartButton" Content="关闭自启" MinWidth="86" Padding="6,2" Click="DisableAutoStartButton_Click"/>

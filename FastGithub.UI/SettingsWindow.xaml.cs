@@ -10,6 +10,7 @@ namespace FastGithub.UI
         public SettingsWindow()
         {
             InitializeComponent();
+            AutoStartDirectoryHint.Text = AutoStartInstallPath.DirectoryHint;
             this.RefreshAutoStartStatus();
             StartMinimizedCheckBox.IsChecked = Properties.Settings.Default.StartMinimized;
         }
