@@ -75,6 +75,10 @@ dotnet build FastGithub.UI/FastGithub.UI.csproj -c Release -m:1 -nr:false
 | `appsettings/` | 9 份域名配置（github / google / microsoft / fastly …） |
 | `dnscrypt-proxy/` | 加密 DNS 组件 |
 
+## 发布
+
+维护者可通过 GitHub Actions 创建 Release，或在 Windows 上使用 `release-local.ps1` 演练打包及正式发布。版本准备、产物校验和重试步骤见 [发布流程](docs/本地发布流程.md)，各版本正文维护在 [release-notes](release-notes/README.md)。
+
 ## 运行
 
 - **正常用法**：以**管理员身份**运行 `fastgithub.exe`。
