@@ -1,7 +1,9 @@
 using System;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
+using System.Text;
 
 namespace FastGithub.UI
 {
@@ -12,6 +14,9 @@ namespace FastGithub.UI
 
         private const FileSystemRights GenericWrite = (FileSystemRights)0x40000000;
         private const FileSystemRights GenericAll = (FileSystemRights)0x10000000;
+        private const FileSystemRights ChangeVolumeRoot = GenericAll |
+            FileSystemRights.DeleteSubdirectoriesAndFiles | FileSystemRights.ChangePermissions |
+            FileSystemRights.TakeOwnership;
         private const FileSystemRights ChangeExistingPath = GenericWrite | GenericAll |
             FileSystemRights.Delete | FileSystemRights.DeleteSubdirectoriesAndFiles |
             FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership |
@@ -26,10 +31,18 @@ namespace FastGithub.UI
         {
             var directory = new FileInfo(executablePath).Directory;
             // 任务计划程序会展开百分号变量，动作必须始终指向固定的本地文件。
-            if (directory?.Parent == null || executablePath.Contains("%") ||
-                new DriveInfo(directory.Root.FullName).DriveType != DriveType.Fixed)
+            if (directory?.Parent == null || executablePath.Contains("%"))
             {
                 throw new InvalidOperationException($"请选择本地固定磁盘上的受保护子目录。路径不能含 %。\n\n{DirectoryOptions}");
+            }
+
+            var root = directory.Root.FullName;
+            var drive = root.Length == 3 && root[1] == ':' && root[2] == '\\' ? new DriveInfo(root) : null;
+            if (drive == null || drive.DriveType != DriveType.Fixed ||
+                IsMountedVolumeDrive(root) == false)
+            {
+                throw new InvalidOperationException(
+                    $"请选择 Windows 直接挂载的本地固定盘符下的子目录。登录自启路径不能使用目录映射盘符。\n\n{root}\n{DirectoryOptions}");
             }
 
             if (File.Exists(Path.Combine(directory.FullName, Program.BackendFileName)) == false)
@@ -37,16 +50,49 @@ namespace FastGithub.UI
                 throw new InvalidOperationException("登录自启需要 FastGithub.UI.exe 与 fastgithub.exe 位于同一目录。");
             }
 
-            ValidateAncestors(directory.Parent);
+            // NTFS 卷根不能被改名。有权限修改卷根自身属性，也不能据此替换受保护的子目录。
+            // 卷根仍需检查所有者、重解析点，以及删除子项、改写权限或取得所有权的授权。
+            var rootRights = string.Equals(drive.DriveFormat, "NTFS", StringComparison.OrdinalIgnoreCase)
+                ? ChangeVolumeRoot : ChangeExistingPath;
+            ValidateAncestors(directory.Parent, rootRights);
             ValidateInstallation(directory);
         }
 
-        private static void ValidateAncestors(DirectoryInfo? directory)
+        private static bool IsMountedVolumeDrive(string root)
+        {
+            var volumePath = new StringBuilder(50);
+            if (GetVolumeNameForVolumeMountPoint(root, volumePath, volumePath.Capacity) == false)
+            {
+                return false;
+            }
+
+            // 卷 API 返回 \\?\Volume{GUID}\。直接盘符与该卷名必须指向同一设备。
+            // SUBST 等目录映射会指向另一个 DOS 路径，跳过真实父目录会漏查权限。
+            var volumeName = volumePath.ToString().Substring(4).TrimEnd('\\');
+            var driveDevice = ReadDeviceMapping(root.Substring(0, 2));
+            return driveDevice != null && string.Equals(driveDevice, ReadDeviceMapping(volumeName), StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string? ReadDeviceMapping(string name)
+        {
+            var target = new StringBuilder(1024);
+            return QueryDosDevice(name, target, target.Capacity) == 0 ? null : target.ToString();
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetVolumeNameForVolumeMountPoint(string mountPoint, StringBuilder volumeName, int capacity);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern uint QueryDosDevice(string deviceName, StringBuilder targetPath, int capacity);
+
+        private static void ValidateAncestors(DirectoryInfo? directory, FileSystemRights rootRights)
         {
             if (directory != null)
             {
-                ValidateAncestors(directory.Parent);
-                ValidateAccess(directory, ChangeExistingPath);
+                var parent = directory.Parent;
+                ValidateAncestors(parent, rootRights);
+                ValidateAccess(directory, parent == null ? rootRights : ChangeExistingPath);
             }
         }
 
